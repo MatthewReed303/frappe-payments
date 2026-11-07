@@ -273,7 +273,7 @@
    "bold": 0,
    "collapsible": 0,
    "columns": 0,
-   "description": "The signing secret of a Stripe webhook sending payment_intent.succeeded to /api/method/payments.payment_gateways.doctype.stripe_settings.stripe_settings.webhook?gateway=<Gateway Name>. Payments are then recorded even when the payer doesn't return to the site.",
+   "description": "The signing secret of a Stripe webhook sending payment_intent.succeeded to this gateway's webhook URL, shown here once saved. Payments are then recorded even when the payer doesn't return to the site.",
    "fieldname": "webhook_secret",
    "fieldtype": "Password",
    "hidden": 0,
