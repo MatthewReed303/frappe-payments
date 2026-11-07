@@ -53,6 +53,21 @@ def get_context(context):
 			# authenticate the payer (3-D Secure) and wallets work
 			settings = frappe.get_doc("Stripe Settings", gateway_controller)
 			intent = settings.payment_intent(context.reference_doctype, context.reference_docname)
+			if intent.status == "succeeded":
+				# paid already (the payer came back to this page): recorded once, then on as after paying
+				frappe.local.flags.commit = True
+				frappe.local.flags.redirect_location = (
+					settings.record_payment_intent(intent)
+					or f"/payment-success?doctype={context.reference_doctype}&docname={context.reference_docname}"
+				)
+				raise frappe.Redirect(302)
+			if intent.status == "processing":
+				frappe.redirect_to_message(
+					_("Payment processing"),
+					_("Your payment is processing. You'll get an email once it's confirmed."),
+				)
+				frappe.local.flags.redirect_location = frappe.local.response.location
+				raise frappe.Redirect(302)
 			context.client_secret = intent.client_secret
 			reference = frappe.get_doc(context.reference_doctype, context.reference_docname)
 			context["amount"] = fmt_money(amount=reference.grand_total, currency=reference.currency)

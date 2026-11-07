@@ -82,3 +82,35 @@ class TestStripeSettings(IntegrationTestCase):
 			self.assertRaises(frappe.ValidationError),
 		):
 			settings.refund("Payment Request", "PR-2", 5, "CN-2")
+
+	def test_pay_page_sends_a_payer_who_has_paid_on(self):
+		from unittest.mock import MagicMock, patch
+
+		import frappe
+
+		from payments.templates.pages import stripe_checkout
+
+		settings = MagicMock()
+		settings.payment_intent.return_value = frappe._dict(status="succeeded", client_secret="cs_x")
+		settings.record_payment_intent.return_value = "/order/SO-1"
+		form = dict.fromkeys(stripe_checkout.expected_keys, "x")
+		form.update(amount=10, currency="NZD", reference_doctype="Payment Request")
+		get_doc = frappe.get_doc
+		with (
+			patch.object(frappe.local, "form_dict", frappe._dict(form)),
+			patch.object(stripe_checkout, "get_gateway_controller", return_value="_Test Stripe"),
+			patch.object(stripe_checkout, "get_api_key", return_value="pk_test_x"),
+			patch.object(stripe_checkout, "get_header_image", return_value=None),
+			patch.object(stripe_checkout, "is_a_subscription", return_value=False),
+			patch(
+				"frappe.get_doc",
+				side_effect=lambda *args, **kwargs: (
+					settings if args[0] == "Stripe Settings" else get_doc(*args, **kwargs)
+				),
+			),
+			self.assertRaises(frappe.Redirect),
+		):
+			stripe_checkout.get_context(frappe._dict())
+		self.assertEqual(frappe.local.flags.redirect_location, "/order/SO-1")
+		self.assertTrue(frappe.local.flags.commit)
+		frappe.local.flags.commit = False
