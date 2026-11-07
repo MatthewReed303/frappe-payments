@@ -1,5 +1,64 @@
 var stripe = Stripe("{{ publishable_key }}");
+{% if client_secret %}
+// One-off payments: Stripe's Payment Element confirms a PaymentIntent, with 3-D Secure when the
+// payer's bank asks for it, then the site checks the payment with Stripe and records it.
+var elements = stripe.elements({ clientSecret: "{{ client_secret }}" });
+var payment = elements.create("payment", { defaultValues: { billingDetails: { name: "{{ payer_name }}", email: "{{ payer_email }}" } } });
+payment.mount("#card-element");
 
+function showOutcome(message, failed) {
+	$(".outcome .error, .outcome .success").hide();
+	$(failed ? ".outcome .error" : ".outcome .success").text(message).show();
+}
+
+function recordPayment(paymentIntent) {
+	return frappe.call({
+		method: "payments.templates.pages.stripe_checkout.confirm_payment",
+		freeze: true,
+		args: {
+			payment_intent: paymentIntent,
+			reference_doctype: "{{ reference_doctype }}",
+			reference_docname: "{{ reference_docname }}",
+			payment_gateway: "{{ payment_gateway }}",
+		},
+	}).then(function (r) {
+		var result = r.message || {};
+		if (result.status === "Completed") {
+			$("#submit").hide();
+			showOutcome({{ _("Your payment has been successfully registered.") | json }});
+			window.location.href = result.redirect_to;
+		} else {
+			showOutcome(result.message, result.status !== "Processing");
+			$("#submit").prop("disabled", false);
+		}
+	});
+}
+
+frappe.ready(function () {
+	// back from the bank's authentication page
+	var returned = new URLSearchParams(window.location.search).get("payment_intent");
+	if (returned) recordPayment(returned);
+
+	$("#submit").off("click").on("click", function (e) {
+		e.preventDefault();
+		$("#submit").prop("disabled", true);
+		stripe
+			.confirmPayment({
+				elements: elements,
+				confirmParams: { return_url: window.location.href.split("#")[0] },
+				redirect: "if_required",
+			})
+			.then(function (result) {
+				if (result.error) {
+					showOutcome(result.error.message, true);
+					$("#submit").prop("disabled", false);
+				} else {
+					recordPayment(result.paymentIntent.id);
+				}
+			});
+	});
+});
+{% else %}
 var elements = stripe.elements();
 
 var style = {
@@ -84,3 +143,4 @@ frappe.ready(function() {
 		stripe.createToken(card, extraDetails).then(setOutcome);
 	})
 });
+{% endif %}

@@ -22,6 +22,7 @@
 		</h4>
 		<form id="payment-form">
 			<div class="form-row row">
+				{% if not client_secret %}
 				<div class="group col-12">
 					<div>
 						<label>
@@ -38,9 +39,10 @@
 						</label>
 					</div>
 				</div>
+				{% endif %}
 				<div class="group col-12">
 					<label>
-					<span>{{ _("Card Details") }}</span>
+					<span>{{ _("Card Details") if not client_secret else _("Payment") }}</span>
 				<div id="card-element" name="card-element" class="field"></div>
 				<div id="card-errors" role="alert"></div>
 			</label>
@@ -49,8 +51,8 @@
 			</div>
 			<button type="submit" class="submit mb-4" id="submit">{{_('Pay')}} {{amount}}</button>
 			<div class="outcome text-center">
-				<div class="error" hidden>{{ _("An error occured during the payment process. Please contact us.") }}</div>
-				<div class="success" hidden>{{ _("Your payment has been successfully registered.") }}</div>
+				<div class="error" role="alert" hidden>{{ _("An error occured during the payment process. Please contact us.") }}</div>
+				<div class="success" role="status" hidden>{{ _("Your payment has been successfully registered.") }}</div>
 			</div>
 		</form>
 	</div>

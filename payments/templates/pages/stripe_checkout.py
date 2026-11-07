@@ -4,6 +4,7 @@ import json
 
 import frappe
 from frappe import _
+from frappe.rate_limiter import rate_limit
 from frappe.utils import cint, fmt_money
 
 from payments.payment_gateways.doctype.stripe_settings.stripe_settings import (
@@ -47,6 +48,14 @@ def get_context(context):
 			recurrence = frappe.db.get_value("Payment Plan", payment_plan, "recurrence")
 
 			context["amount"] = context["amount"] + " " + _(recurrence)
+		elif frappe.get_meta(context.reference_doctype).has_field("grand_total"):
+			# a one-off payment: a PaymentIntent for what the document asks, so the bank can
+			# authenticate the payer (3-D Secure) and wallets work
+			settings = frappe.get_doc("Stripe Settings", gateway_controller)
+			intent = settings.payment_intent(context.reference_doctype, context.reference_docname)
+			context.client_secret = intent.client_secret
+			reference = frappe.get_doc(context.reference_doctype, context.reference_docname)
+			context["amount"] = fmt_money(amount=reference.grand_total, currency=reference.currency)
 
 	else:
 		frappe.redirect_to_message(
@@ -99,3 +108,40 @@ def is_a_subscription(reference_doctype, reference_docname):
 	if not frappe.get_meta(reference_doctype).has_field("is_a_subscription"):
 		return False
 	return frappe.db.get_value(reference_doctype, reference_docname, "is_a_subscription")
+
+
+# Guest checkout: the payer returns here from Stripe without a site account.
+@frappe.whitelist(allow_guest=True, methods=["POST"])  # nosemgrep
+@rate_limit(limit=20, seconds=60)
+def confirm_payment(
+	payment_intent: str, reference_doctype: str, reference_docname: str, payment_gateway: str
+):
+	"""After Stripe confirms a payment in the browser: check the PaymentIntent with Stripe and record
+	the payment against its document."""
+	gateway_controller = get_gateway_controller(reference_doctype, reference_docname, payment_gateway)
+	settings = frappe.get_doc("Stripe Settings", gateway_controller)
+	intent = settings.client().payment_intents.retrieve(payment_intent)
+	metadata = intent.metadata or {}
+	if (metadata.get("reference_doctype"), metadata.get("reference_docname")) != (
+		reference_doctype,
+		reference_docname,
+	):
+		raise frappe.PermissionError
+	if intent.status == "succeeded":
+		redirect_to = settings.record_payment_intent(intent)
+		# reachable as a guest, and the payment must be recorded
+		frappe.db.commit()  # nosemgrep
+		return {
+			"status": "Completed",
+			"redirect_to": redirect_to
+			or f"payment-success?doctype={reference_doctype}&docname={reference_docname}",
+		}
+	if intent.status == "processing":
+		return {
+			"status": "Processing",
+			"message": _("Your payment is processing. You'll get an email once it's confirmed."),
+		}
+	return {
+		"status": "Failed",
+		"message": _("The payment didn't go through. Please try again or use another card."),
+	}
