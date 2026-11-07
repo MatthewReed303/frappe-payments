@@ -73,6 +73,10 @@ class TestStripeSettings(IntegrationTestCase):
 		self.assertEqual((params["payment_intent"], params["amount"]), ("pi_test_1", 1250))
 		self.assertIn("CN-1", client.refunds.create.call_args.kwargs["options"]["idempotency_key"])
 		self.assertEqual(log.call_args.kwargs["request_id"], "re_test_1")
+		self.assertEqual(
+			(log.call_args.kwargs["reference_doctype"], log.call_args.kwargs["reference_docname"]),
+			("Integration Request", "IR-1"),
+		)
 		with (
 			patch.object(stripe_settings, "intent_request", return_value=None),
 			self.assertRaises(frappe.ValidationError),

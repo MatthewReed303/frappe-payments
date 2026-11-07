@@ -430,8 +430,9 @@ class StripeSettings(Document):
 				"currency": currency,
 			},
 			service_name="Stripe",
-			reference_doctype=reference_doctype,
-			reference_docname=reference_docname,
+			# logged against the payment it refunds: ERPNext refuses new requests for a paid Payment Request
+			reference_doctype="Integration Request",
+			reference_docname=request.name,
 			request_id=refund.id,
 		)
 		return refund.id
