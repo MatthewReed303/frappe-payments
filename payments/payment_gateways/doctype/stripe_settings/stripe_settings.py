@@ -400,6 +400,42 @@ class StripeSettings(Document):
 		request.db_set("status", "Completed", update_modified=False)
 		return reference.run_method("on_payment_authorized", "Completed")
 
+	def refund(self, reference_doctype: str, reference_docname: str, amount: float, key: str) -> str:
+		"""Refund part or all of what a document's PaymentIntent took, once per key (e.g. the credit
+		note it is for). Returns the Stripe Refund id."""
+		request = intent_request(reference_doctype, reference_docname)
+		if not request or request.status != "Completed":
+			frappe.throw(
+				_("{0} {1} has no card payment to refund").format(_(reference_doctype), reference_docname)
+			)
+		currency = frappe.db.get_value(reference_doctype, reference_docname, "currency")
+		units = minor_units(amount, currency)
+		refund = self.client().refunds.create(
+			params={
+				"payment_intent": request.request_id,
+				"amount": units,
+				"metadata": {
+					"reference_doctype": reference_doctype,
+					"reference_docname": reference_docname,
+					"key": key,
+				},
+			},
+			options={"idempotency_key": f"{frappe.local.site}:refund:{request.request_id}:{key}:{units}"},
+		)
+		create_request_log(
+			{
+				"refund": refund.id,
+				"payment_intent": request.request_id,
+				"amount": amount,
+				"currency": currency,
+			},
+			service_name="Stripe",
+			reference_doctype=reference_doctype,
+			reference_docname=reference_docname,
+			request_id=refund.id,
+		)
+		return refund.id
+
 
 def intent_request(reference_doctype: str, reference_docname: str):
 	"""The Integration Request of the latest PaymentIntent made for a document."""

@@ -50,3 +50,31 @@ class TestStripeSettings(IntegrationTestCase):
 		settings.insert(ignore_permissions=True)
 		with self.assertRaises(frappe.PermissionError):
 			webhook(gateway="_Test Stripe")
+
+	def test_refund_takes_back_part_of_a_card_payment_once(self):
+		from unittest.mock import MagicMock, patch
+
+		import frappe
+
+		from payments.payment_gateways.doctype.stripe_settings import stripe_settings
+
+		settings = frappe.new_doc("Stripe Settings")
+		client = MagicMock()
+		client.refunds.create.return_value = frappe._dict(id="re_test_1")
+		paid = frappe._dict(name="IR-1", request_id="pi_test_1", status="Completed")
+		with (
+			patch.object(stripe_settings.StripeSettings, "client", return_value=client),
+			patch.object(stripe_settings, "intent_request", return_value=paid),
+			patch("frappe.db.get_value", return_value="NZD"),
+			patch.object(stripe_settings, "create_request_log") as log,
+		):
+			self.assertEqual(settings.refund("Payment Request", "PR-1", 12.5, "CN-1"), "re_test_1")
+		params = client.refunds.create.call_args.kwargs["params"]
+		self.assertEqual((params["payment_intent"], params["amount"]), ("pi_test_1", 1250))
+		self.assertIn("CN-1", client.refunds.create.call_args.kwargs["options"]["idempotency_key"])
+		self.assertEqual(log.call_args.kwargs["request_id"], "re_test_1")
+		with (
+			patch.object(stripe_settings, "intent_request", return_value=None),
+			self.assertRaises(frappe.ValidationError),
+		):
+			settings.refund("Payment Request", "PR-2", 5, "CN-2")
