@@ -9,7 +9,7 @@ from frappe import _
 from frappe.integrations.utils import create_request_log, make_get_request
 from frappe.model.document import Document
 from frappe.rate_limiter import rate_limit
-from frappe.utils import call_hook_method, cint, flt, get_url
+from frappe.utils import call_hook_method, cint, flt, get_url, validate_email_address
 
 from payments.utils import create_payment_gateway
 
@@ -344,7 +344,8 @@ class StripeSettings(Document):
 				"automatic_payment_methods": {"enabled": True},
 				"description": reference.get("subject")
 				or _("{0} {1}").format(_(reference_doctype), reference_docname),
-				"receipt_email": reference.get("email_to") or None,
+				# a request made without the customer's email holds the user who made it
+				"receipt_email": validate_email_address(reference.get("email_to") or "") or None,
 				"metadata": {
 					"reference_doctype": reference_doctype,
 					"reference_docname": reference_docname,

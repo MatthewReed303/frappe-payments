@@ -76,7 +76,10 @@ def get_context(context):
 				raise frappe.Redirect(302)
 			context.client_secret = intent.client_secret
 			reference = frappe.get_doc(context.reference_doctype, context.reference_docname)
-			context["amount"] = fmt_money(amount=reference.grand_total, currency=reference.currency)
+			# with the code, as many currencies share a symbol
+			context["amount"] = (
+				f"{fmt_money(amount=reference.grand_total, currency=reference.currency)} {reference.currency}"
+			)
 
 	else:
 		frappe.redirect_to_message(

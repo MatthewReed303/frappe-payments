@@ -228,3 +228,23 @@ class TestStripeSettings(IntegrationTestCase):
 		self.assertEqual(request.db_set.call_args.args[0]["status"], "Failed")
 		reference.run_method.assert_not_called()
 		log_error.assert_called_once()
+
+	def test_a_request_without_the_payers_email_still_opens(self):
+		from unittest.mock import MagicMock, patch
+
+		import frappe
+
+		from payments.payment_gateways.doctype.stripe_settings import stripe_settings
+
+		settings = frappe.new_doc("Stripe Settings")
+		client = MagicMock()
+		client.payment_intents.create.return_value = frappe._dict(id="pi_test_2")
+		request = frappe._dict(grand_total=40, currency="USD", email_to="Administrator", subject=None)
+		with (
+			patch.object(stripe_settings.StripeSettings, "client", return_value=client),
+			patch.object(stripe_settings, "intent_request", return_value=None),
+			patch("frappe.get_doc", return_value=request),
+			patch.object(stripe_settings, "create_request_log"),
+		):
+			settings.payment_intent("Payment Request", "PR-3")
+		self.assertIsNone(client.payment_intents.create.call_args.kwargs["params"]["receipt_email"])
