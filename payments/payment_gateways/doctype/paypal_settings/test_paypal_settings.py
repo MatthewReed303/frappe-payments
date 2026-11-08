@@ -48,15 +48,18 @@ def paypal_order(order_id, status="APPROVED", value="300.00", currency="NZD", ca
 	unit = {"reference_id": "PR", "amount": {"currency_code": currency, "value": value}}
 	if capture:
 		unit["payments"] = {"captures": [capture]}
+	links = [{"rel": "self", "href": f"https://api-m.sandbox.paypal.com/v2/checkout/orders/{order_id}"}]
+	if status in ("CREATED", "PAYER_ACTION_REQUIRED"):
+		# as PayPal answers: an approved order has no link for the payer
+		links.append(
+			{"rel": "payer-action", "href": f"https://www.sandbox.paypal.com/checkoutnow?token={order_id}"}
+		)
 	return {
 		"id": order_id,
 		"status": status,
 		"purchase_units": [unit],
 		"payer": {"email_address": "payer@example.com"},
-		"links": [
-			{"rel": "self", "href": f"https://api-m.sandbox.paypal.com/v2/checkout/orders/{order_id}"},
-			{"rel": "payer-action", "href": f"https://www.sandbox.paypal.com/checkoutnow?token={order_id}"},
-		],
+		"links": links,
 	}
 
 
@@ -247,6 +250,29 @@ class TestPayPalSettings(unittest.TestCase):
 			settings.get_payment_url(
 				amount=10, currency="USD", reference_doctype="Sales Order", reference_docname="SO-1"
 			)
+
+	def test_a_link_is_made_while_erpnext_submits_the_payment_request(self):
+		# ERPNext asks for the payment URL in the Payment Request's before_submit
+		settings = self.settings()
+		from frappe.model.document import Document
+
+		draft = payment_request("_Test PR Submitting", docstatus=0, outstanding=0)
+		with (
+			patch.object(pp, "get_reference", return_value=draft),
+			# the draft is in the database by then; this one is made up
+			patch.object(Document, "_validate_links", lambda doc: None),
+		):
+			url = settings.get_payment_url(
+				amount=300,
+				currency="NZD",
+				reference_doctype="Payment Request",
+				reference_docname="_Test PR Submitting",
+			)
+		self.assertIn("paypal_settings.pay?integration_request=", url)
+		request = frappe.get_doc("Integration Request", url.rsplit("=", 1)[1])
+		# what the payer is asked for is worked out when the link is opened
+		with patch.object(pp, "get_reference", return_value=payment_request("_Test PR Submitting")):
+			self.assertEqual(settings.amount_due(request)["value"], "300.00")
 
 	def test_order_is_for_what_the_payment_request_still_asks(self):
 		settings = self.settings()

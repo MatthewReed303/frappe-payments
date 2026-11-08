@@ -434,7 +434,10 @@ class PayPalSettings(Document):
 							_(reference.doctype), reference.name
 						)
 					)
-				data.amount, data.currency = amount_to_pay(reference)
+				if reference.docstatus:
+					data.amount, data.currency = amount_to_pay(reference)
+				# else ERPNext asks for the link while submitting the request; what is owed is checked
+				# when the link is opened
 			existing = frappe.db.get_value(
 				"Integration Request",
 				{
@@ -585,7 +588,7 @@ class PayPalSettings(Document):
 					# PayPal asks the payer to choose another way to pay, and the capture is tried again
 					data["declined"] = cint(data.get("declined")) + 1
 					request.db_set("data", frappe.as_json(data), update_modified=False)
-					return approve_link(order)
+					return approve_link(order, cint(self.paypal_sandbox))
 				else:
 					raise
 		return self.record_order(request, order, asked)
@@ -1266,10 +1269,14 @@ def order_amount(order: dict) -> dict | None:
 	return ((order.get("purchase_units") or [{}])[0]).get("amount")
 
 
-def approve_link(order: dict) -> str:
+def approve_link(order: dict, sandbox: bool | None = None) -> str:
 	for link in order.get("links") or []:
 		if link.get("rel") in ("payer-action", "approve"):
 			return link["href"]
+	if order.get("id") and sandbox is not None:
+		# an approved order whose payment was declined has no link: the payer approves it again
+		host = "https://www.sandbox.paypal.com" if sandbox else "https://www.paypal.com"
+		return f"{host}/checkoutnow?" + urlencode({"token": order["id"]})
 	frappe.throw(_("PayPal didn't give a page to approve the payment on"))
 
 
