@@ -509,9 +509,20 @@ class StripeSettings(Document):
 		units = minor_units(amount, currency)
 		client = self.client()
 		# Stripe forgets idempotency keys after a day: a refund made for this key before is reused
-		for made in client.refunds.list(params={"payment_intent": request.request_id, "limit": 100}).data:
+		refunds = client.refunds.list(params={"payment_intent": request.request_id, "limit": 100}).data
+		for made in refunds:
 			if (made.metadata or {}).get("key") == key and made.status != "failed":
 				return made.id
+		# refunds made here or in Stripe's dashboard
+		left = client.payment_intents.retrieve(request.request_id).amount_received - sum(
+			made.amount for made in refunds if made.status in ("succeeded", "pending")
+		)
+		if units > left:
+			frappe.throw(
+				_(
+					"Only {0} of this card payment can still be refunded: the rest was refunded in Stripe. Record that refund in ERPNext, then refund what is left."
+				).format(fmt_money(major_units(left, currency), currency=currency))
+			)
 		refund = client.refunds.create(
 			params={
 				"payment_intent": request.request_id,
@@ -612,7 +623,33 @@ def webhook(gateway: str | None = None):
 	elif event.type in ("charge.dispute.created", "charge.dispute.closed"):
 		record_dispute(settings.client().disputes.retrieve(event.data.object.id))
 		frappe.db.commit()  # nosemgrep
+	elif event.type == "refund.created":
+		record_refund(settings.client().refunds.retrieve(event.data.object.id))
+		frappe.db.commit()  # nosemgrep
 	return {"received": True}
+
+
+def record_refund(refund) -> None:
+	"""Tell staff about a refund made in Stripe's dashboard, on the documents the payment paid. A
+	refund made here carries its key, and is recorded here."""
+	if (refund.metadata or {}).get("key") or refund.status not in ("succeeded", "pending"):
+		return
+	paid = frappe.db.get_value(
+		"Integration Request",
+		{"integration_request_service": "Stripe", "request_id": refund.payment_intent},
+		["reference_doctype", "reference_docname"],
+		as_dict=True,
+	)
+	if not paid or not frappe.db.exists(paid.reference_doctype, paid.reference_docname):
+		return
+	reference = frappe.get_doc(paid.reference_doctype, paid.reference_docname)
+	amount = fmt_money(major_units(refund.amount, refund.currency), currency=refund.currency.upper())
+	tell_staff(
+		reference,
+		_(
+			"{0} of the card payment for {1} {2} was refunded in Stripe. Record the refund in ERPNext, and don't refund it again."
+		).format(amount, _(reference.doctype), reference.name),
+	)
 
 
 def record_dispute(dispute) -> None:
@@ -687,11 +724,16 @@ def tell_staff(reference, note: str) -> None:
 	documents = [reference]
 	if reference.get("reference_doctype") and reference.get("reference_name"):
 		documents.append(frappe.get_doc(reference.reference_doctype, reference.reference_name))
+	noted = False
 	for doc in documents:
 		if not frappe.db.exists(
 			"Comment", {"reference_doctype": doc.doctype, "reference_name": doc.name, "content": note}
 		):
 			doc.add_comment("Info", note)
+			noted = True
+	if not noted:
+		# told already: the gateway sent the same news again
+		return
 	staff = frappe.get_all(
 		"Has Role",
 		filters={

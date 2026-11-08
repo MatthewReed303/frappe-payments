@@ -108,6 +108,7 @@ class TestStripeSettings(IntegrationTestCase):
 		client = MagicMock()
 		client.refunds.list.return_value = frappe._dict(data=[])
 		client.refunds.create.return_value = frappe._dict(id="re_test_1")
+		client.payment_intents.retrieve.return_value = frappe._dict(amount_received=5000)
 		paid = frappe._dict(name="IR-1", request_id="pi_test_1", status="Completed")
 		with (
 			patch.object(stripe_settings.StripeSettings, "client", return_value=client),
@@ -142,6 +143,47 @@ class TestStripeSettings(IntegrationTestCase):
 		):
 			self.assertEqual(settings.refund("Payment Request", "PR-1", 12.5, "CN-1"), "re_test_1")
 		client.refunds.create.assert_not_called()
+
+		# $40 of the $50 was refunded in Stripe's dashboard: no more than what is left is refunded here
+		client.refunds.list.return_value = frappe._dict(
+			data=[frappe._dict(id="re_dashboard", status="succeeded", amount=4000, metadata={})]
+		)
+		with (
+			patch.object(stripe_settings.StripeSettings, "client", return_value=client),
+			patch.object(stripe_settings, "intent_request", return_value=paid),
+			patch("frappe.db.get_value", return_value="NZD"),
+			self.assertRaises(frappe.ValidationError) as refused,
+		):
+			settings.refund("Payment Request", "PR-1", 12.5, "CN-3")
+		self.assertIn("10.00", str(refused.exception))
+		client.refunds.create.assert_not_called()
+
+	def test_a_refund_made_in_stripe_is_noted_for_staff(self):
+		from unittest.mock import MagicMock, patch
+
+		import frappe
+
+		from payments.payment_gateways.doctype.stripe_settings import stripe_settings
+
+		order = MagicMock(doctype="Payment Request")
+		order.name = "PR-1"
+		paid = frappe._dict(reference_doctype="Payment Request", reference_docname="PR-1")
+		refund = frappe._dict(
+			payment_intent="pi_1", amount=1000, currency="nzd", status="succeeded", metadata={}
+		)
+		with (
+			patch("frappe.db.get_value", return_value=paid),
+			patch("frappe.db.exists", return_value=True),
+			patch("frappe.get_doc", return_value=order),
+			patch.object(stripe_settings, "tell_staff") as tell_staff,
+		):
+			stripe_settings.record_refund(refund)
+			self.assertIn("10.00", tell_staff.call_args.args[1])
+			self.assertIn("refunded in Stripe", tell_staff.call_args.args[1])
+			# a refund made here carries its key
+			tell_staff.reset_mock()
+			stripe_settings.record_refund(frappe._dict(refund, metadata={"key": "CN-1"}))
+			tell_staff.assert_not_called()
 
 	def test_pay_page_sends_a_payer_who_has_paid_on(self):
 		from unittest.mock import MagicMock, patch
@@ -369,6 +411,18 @@ class TestStripeSettings(IntegrationTestCase):
 
 			stripe_settings.record_dispute(frappe._dict(dispute, status="lost"))
 			self.assertIn("taken the money back", order.add_comment.call_args.args[1])
+
+		# the same news sent again is noted, and told, once
+		notified = notify.call_count
+		with (
+			patch("frappe.db.get_value", side_effect=get_value),
+			patch("frappe.db.exists", return_value=True),
+			patch("frappe.get_doc", side_effect=lambda *a, **k: docs.get(a[0]) or real_get_doc(*a, **k)),
+			patch.object(stripe_settings, "enqueue_create_notification") as notify_again,
+		):
+			stripe_settings.record_dispute(frappe._dict(dispute, status="lost"))
+		notify_again.assert_not_called()
+		self.assertTrue(notified)
 
 	def test_a_charge_is_for_what_the_document_still_asks(self):
 		from unittest.mock import MagicMock, patch
