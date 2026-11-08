@@ -93,6 +93,34 @@ def payment_request(name, docstatus=1, status="Requested", grand_total=500, outs
 
 
 class TestPayPalSettings(unittest.TestCase):
+	def test_what_is_owed_is_in_the_requests_currency(self):
+		from unittest.mock import MagicMock, patch
+
+		from payments.payment_gateways.doctype.paypal_settings import paypal_settings as gateway
+
+		# a USD order for a customer whose account is in NZD: ERPNext keeps what is owed in NZD
+		values = {
+			"status": "Requested",
+			"currency": "USD",
+			"party_account_currency": "NZD",
+			"grand_total": 60.12,
+			"outstanding_amount": 107.70,
+		}
+		request = MagicMock(docstatus=1, outstanding_amount=107.70)
+		request.get.side_effect = lambda field, default=None: values.get(field, default)
+		request.meta.has_field.return_value = True
+		with patch(
+			"erpnext.accounts.doctype.payment_request.payment_request.get_requested_amount_in_party_account_currency",
+			return_value=107.70,
+		):
+			self.assertEqual(gateway.amount_to_pay(request), (60.12, "USD"))
+			# half paid
+			values["outstanding_amount"] = request.outstanding_amount = 53.85
+			self.assertEqual(gateway.amount_to_pay(request), (30.06, "USD"))
+		values.update(party_account_currency="USD", outstanding_amount=60.12)
+		request.outstanding_amount = 60.12
+		self.assertEqual(gateway.amount_to_pay(request), (60.12, "USD"))
+
 	def setUp(self):
 		self.started = frappe.utils.now_datetime()
 		self.client_ids = []
@@ -462,7 +490,11 @@ class TestPayPalSettings(unittest.TestCase):
 			patch.object(pp, "http_request", fake),
 			patch.object(pp, "get_reference", return_value=reference),
 		):
-			self.assertIsInstance(settings.complete(request), pp.Message)
+			message = settings.complete(request)
+		self.assertIsInstance(message, pp.Message)
+		# said to the payer, without the document's name
+		self.assertNotIn(self.reference_name, str(message))
+		self.assertIn("haven't been charged", str(message))
 		self.assertFalse(fake.made("POST", "/v2/checkout/orders/ORDER-8/capture"))
 		request.reload()
 		self.assertEqual(request.status, "Cancelled")
