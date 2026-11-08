@@ -477,7 +477,12 @@ class StripeSettings(Document):
 			)
 		currency = frappe.db.get_value(reference_doctype, reference_docname, "currency")
 		units = minor_units(amount, currency)
-		refund = self.client().refunds.create(
+		client = self.client()
+		# Stripe forgets idempotency keys after a day: a refund made for this key before is reused
+		for made in client.refunds.list(params={"payment_intent": request.request_id, "limit": 100}).data:
+			if (made.metadata or {}).get("key") == key and made.status != "failed":
+				return made.id
+		refund = client.refunds.create(
 			params={
 				"payment_intent": request.request_id,
 				"amount": units,

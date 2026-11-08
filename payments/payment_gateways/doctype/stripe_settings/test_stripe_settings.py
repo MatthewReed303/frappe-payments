@@ -60,6 +60,7 @@ class TestStripeSettings(IntegrationTestCase):
 
 		settings = frappe.new_doc("Stripe Settings")
 		client = MagicMock()
+		client.refunds.list.return_value = frappe._dict(data=[])
 		client.refunds.create.return_value = frappe._dict(id="re_test_1")
 		paid = frappe._dict(name="IR-1", request_id="pi_test_1", status="Completed")
 		with (
@@ -82,6 +83,19 @@ class TestStripeSettings(IntegrationTestCase):
 			self.assertRaises(frappe.ValidationError),
 		):
 			settings.refund("Payment Request", "PR-2", 5, "CN-2")
+
+		# asked again days later, the refund already made for that credit note is the answer
+		client.refunds.create.reset_mock()
+		client.refunds.list.return_value = frappe._dict(
+			data=[frappe._dict(id="re_test_1", status="succeeded", metadata={"key": "CN-1"})]
+		)
+		with (
+			patch.object(stripe_settings.StripeSettings, "client", return_value=client),
+			patch.object(stripe_settings, "intent_request", return_value=paid),
+			patch("frappe.db.get_value", return_value="NZD"),
+		):
+			self.assertEqual(settings.refund("Payment Request", "PR-1", 12.5, "CN-1"), "re_test_1")
+		client.refunds.create.assert_not_called()
 
 	def test_pay_page_sends_a_payer_who_has_paid_on(self):
 		from unittest.mock import MagicMock, patch
