@@ -12,7 +12,7 @@ frappe.ui.form.on("Stripe Settings", {
 			"webhook_secret",
 			"description",
 			__(
-				"The signing secret of a Stripe webhook sending payment_intent.succeeded to {0}. Payments are then recorded even when the payer doesn't return to the site.",
+				"The signing secret of a Stripe webhook sending payment_intent.succeeded, charge.dispute.created and charge.dispute.closed to {0}. Payments are then recorded even when the payer doesn't return to the site, and Accounts Managers are told when a customer disputes a payment.",
 				[`<code>${frappe.utils.escape_html(url)}</code>`]
 			)
 		);

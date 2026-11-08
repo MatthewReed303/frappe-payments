@@ -248,3 +248,56 @@ class TestStripeSettings(IntegrationTestCase):
 		):
 			settings.payment_intent("Payment Request", "PR-3")
 		self.assertIsNone(client.payment_intents.create.call_args.kwargs["params"]["receipt_email"])
+
+	def test_a_disputed_payment_is_noted_for_staff(self):
+		from unittest.mock import MagicMock, patch
+
+		import frappe
+
+		from payments.payment_gateways.doctype.stripe_settings import stripe_settings
+
+		order = MagicMock(doctype="Sales Order")
+		order.name = "SO-1"
+		request = MagicMock(doctype="Payment Request")
+		request.name, request.reference_doctype, request.reference_name = "PR-1", "Sales Order", "SO-1"
+		request.get.side_effect = {"reference_doctype": "Sales Order", "reference_name": "SO-1"}.get
+		paid = frappe._dict(reference_doctype="Payment Request", reference_docname="PR-1")
+		dispute = frappe._dict(
+			payment_intent="pi_1",
+			amount=3800,
+			currency="nzd",
+			reason="fraudulent",
+			status="needs_response",
+			evidence_details={"due_by": 1795000000},
+		)
+
+		docs = {"Payment Request": request, "Sales Order": order}
+		real_get_doc, real_get_value, real_exists = frappe.get_doc, frappe.db.get_value, frappe.db.exists
+
+		def get_value(doctype, *args, **kwargs):
+			if doctype in ("Integration Request", "User"):
+				return paid if doctype == "Integration Request" else 1
+			return real_get_value(doctype, *args, **kwargs)
+
+		def exists(doctype, *args, **kwargs):
+			if doctype in docs or doctype == "Comment":
+				return doctype != "Comment"
+			return real_exists(doctype, *args, **kwargs)
+
+		with (
+			patch("frappe.db.get_value", side_effect=get_value),
+			patch("frappe.db.exists", side_effect=exists),
+			patch("frappe.get_doc", side_effect=lambda *a, **k: docs.get(a[0]) or real_get_doc(*a, **k)),
+			patch.object(stripe_settings.frappe, "get_all", return_value=["accounts@example.com"]),
+			patch.object(stripe_settings, "enqueue_create_notification") as notify,
+		):
+			stripe_settings.record_dispute(dispute)
+			note = order.add_comment.call_args.args[1]
+			self.assertIn("38.00", note)
+			self.assertIn("fraudulent", note)
+			request.add_comment.assert_called_once()
+			self.assertEqual(notify.call_args.args[0], ["accounts@example.com"])
+			self.assertEqual(notify.call_args.args[1]["document_name"], "SO-1")
+
+			stripe_settings.record_dispute(frappe._dict(dispute, status="lost"))
+			self.assertIn("taken the money back", order.add_comment.call_args.args[1])

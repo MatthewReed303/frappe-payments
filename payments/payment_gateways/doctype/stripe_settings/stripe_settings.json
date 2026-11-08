@@ -273,7 +273,7 @@
    "bold": 0,
    "collapsible": 0,
    "columns": 0,
-   "description": "The signing secret of a Stripe webhook sending payment_intent.succeeded to this gateway's webhook URL, shown here once saved. Payments are then recorded even when the payer doesn't return to the site.",
+   "description": "The signing secret of a Stripe webhook sending payment_intent.succeeded, charge.dispute.created and charge.dispute.closed to this gateway's webhook URL, shown here once saved. Payments are then recorded even when the payer doesn't return to the site, and Accounts Managers are told when a customer disputes a payment.",
    "fieldname": "webhook_secret",
    "fieldtype": "Password",
    "hidden": 0,

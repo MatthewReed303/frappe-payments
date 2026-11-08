@@ -1,15 +1,26 @@
 # Copyright (c) 2017, Frappe Technologies and contributors
 # License: MIT. See LICENSE
 
+from datetime import UTC, datetime
 from types import MappingProxyType
 from urllib.parse import urlencode
 
 import frappe
 from frappe import _
+from frappe.desk.doctype.notification_log.notification_log import enqueue_create_notification
 from frappe.integrations.utils import create_request_log, make_get_request
 from frappe.model.document import Document
 from frappe.rate_limiter import rate_limit
-from frappe.utils import call_hook_method, cint, flt, get_url, validate_email_address
+from frappe.utils import (
+	call_hook_method,
+	cint,
+	convert_utc_to_system_timezone,
+	flt,
+	fmt_money,
+	format_datetime,
+	get_url,
+	validate_email_address,
+)
 
 from payments.utils import create_payment_gateway
 
@@ -65,6 +76,14 @@ def minor_units(amount: float, currency: str) -> int:
 		# Stripe takes these to the nearest ten thousandths
 		return cint(round(flt(amount) * 100)) * 10
 	return cint(round(flt(amount) * 100))
+
+
+def major_units(units: int, currency: str) -> float:
+	"""An amount Stripe gives in the currency's smallest unit, in the currency."""
+	currency = currency.upper()
+	if currency in ZERO_DECIMAL_CURRENCIES:
+		return flt(units)
+	return flt(units) / (1000 if currency in THREE_DECIMAL_CURRENCIES else 100)
 
 
 class StripeSettings(Document):
@@ -521,7 +540,74 @@ def webhook(gateway: str | None = None):
 		settings.record_payment_intent(intent)
 		# Stripe retries until the payment is stored, and webhooks are not committed otherwise
 		frappe.db.commit()  # nosemgrep
+	elif event.type in ("charge.dispute.created", "charge.dispute.closed"):
+		record_dispute(settings.client().disputes.retrieve(event.data.object.id))
+		frappe.db.commit()  # nosemgrep
 	return {"received": True}
+
+
+def record_dispute(dispute) -> None:
+	"""Tell staff about a payment the customer disputed with their bank (a chargeback), on the
+	documents it paid. Disputes are answered in Stripe; what was lost is recorded by staff."""
+	paid = frappe.db.get_value(
+		"Integration Request",
+		{"integration_request_service": "Stripe", "request_id": dispute.payment_intent},
+		["reference_doctype", "reference_docname"],
+		as_dict=True,
+	)
+	if not paid or not frappe.db.exists(paid.reference_doctype, paid.reference_docname):
+		return
+	amount = fmt_money(major_units(dispute.amount, dispute.currency), currency=dispute.currency.upper())
+	reason = (dispute.reason or "general").replace("_", " ")
+	if dispute.status in ("won", "warning_closed"):
+		note = _("The dispute over {0} was closed in your favour: the payment stands.").format(amount)
+	elif dispute.status == "lost":
+		note = _(
+			"The customer won their dispute over {0}: Stripe has taken the money back, with its dispute fee. Record it in ERPNext, for example with a credit note."
+		).format(amount)
+	else:
+		due = (dispute.get("evidence_details") or {}).get("due_by")
+		note = _(
+			"The customer disputed {0} with their bank ({1}). Answer it in Stripe by {2}, or the money goes back to them."
+		).format(
+			amount,
+			reason,
+			format_datetime(
+				convert_utc_to_system_timezone(datetime.fromtimestamp(due, UTC).replace(tzinfo=None))
+			)
+			if due
+			else _("the date Stripe gives"),
+		)
+	reference = frappe.get_doc(paid.reference_doctype, paid.reference_docname)
+	documents = [reference]
+	if reference.get("reference_doctype") and reference.get("reference_name"):
+		documents.append(frappe.get_doc(reference.reference_doctype, reference.reference_name))
+	for doc in documents:
+		if not frappe.db.exists(
+			"Comment", {"reference_doctype": doc.doctype, "reference_name": doc.name, "content": note}
+		):
+			doc.add_comment("Info", note)
+	staff = frappe.get_all(
+		"Has Role",
+		filters={
+			"role": "Accounts Manager",
+			"parenttype": "User",
+			"parent": ["not in", ["Administrator", "Guest"]],
+		},
+		pluck="parent",
+		distinct=True,
+	)
+	staff = [user for user in staff if frappe.db.get_value("User", user, "enabled")] or ["Administrator"]
+	enqueue_create_notification(
+		staff,
+		{
+			"type": "Alert",
+			"document_type": documents[-1].doctype,
+			"document_name": documents[-1].name,
+			"subject": note,
+			"from_user": "Administrator",
+		},
+	)
 
 
 def get_gateway_controller(doctype, docname, payment_gateway=None):
