@@ -9,6 +9,7 @@ from frappe.utils import cint, fmt_money
 
 from payments.payment_gateways.doctype.stripe_settings.stripe_settings import (
 	get_gateway_controller,
+	major_units,
 )
 
 no_cache = 1
@@ -48,6 +49,15 @@ def get_context(context):
 			recurrence = frappe.db.get_value("Payment Plan", payment_plan, "recurrence")
 
 			context["amount"] = context["amount"] + " " + _(recurrence)
+		elif context.reference_doctype != "Payment Request" and frappe.get_meta(
+			context.reference_doctype
+		).has_field("grand_total"):
+			# a document with a total is paid through its Payment Request, which records the payment
+			frappe.redirect_to_message(
+				_("Payment not available"), _("This payment link isn't valid. Please ask for a new one.")
+			)
+			frappe.local.flags.redirect_location = frappe.local.response.location
+			raise frappe.Redirect(302)
 		elif context.reference_doctype == "Payment Request":
 			# a one-off payment: a PaymentIntent for what the request asks, so the bank can
 			# authenticate the payer (3-D Secure) and wallets work. Only a Payment Request, which is
@@ -82,10 +92,11 @@ def get_context(context):
 				frappe.local.flags.redirect_location = frappe.local.response.location
 				raise frappe.Redirect(302)
 			context.client_secret = intent.client_secret
-			reference = frappe.get_doc(context.reference_doctype, context.reference_docname)
-			# with the code, as many currencies share a symbol
+			# what the intent asks (the request's outstanding amount), with the code, as many
+			# currencies share a symbol
+			currency = intent.currency.upper()
 			context["amount"] = (
-				f"{fmt_money(amount=reference.grand_total, currency=reference.currency)} {reference.currency}"
+				f"{fmt_money(amount=major_units(intent.amount, currency), currency=currency)} {currency}"
 			)
 
 	else:

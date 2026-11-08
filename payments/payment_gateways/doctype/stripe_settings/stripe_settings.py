@@ -255,7 +255,14 @@ class StripeSettings(Document):
 		if self.data.reference_doctype and self.data.reference_docname:
 			reference = frappe.get_doc(self.data.reference_doctype, self.data.reference_docname)
 			if reference.meta.has_field("grand_total"):
-				# what the document asks, never what the browser sent
+				if reference.doctype != "Payment Request":
+					# only a Payment Request records what is paid for a document with a total
+					frappe.throw(
+						_("Pay {0} {1} through its Payment Request").format(
+							_(reference.doctype), reference.name
+						)
+					)
+				# what the request asks, never what the browser sent
 				self.data.amount, self.data.currency = amount_to_pay(reference)
 		stripe.api_key = self.get_password(fieldname="secret_key", raise_exception=False)
 		stripe.default_http_client = stripe.http_client.RequestsClient()

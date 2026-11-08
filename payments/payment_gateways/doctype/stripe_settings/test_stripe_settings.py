@@ -332,6 +332,7 @@ class TestStripeSettings(IntegrationTestCase):
 		from payments.payment_gateways.doctype.stripe_settings import stripe_settings
 
 		request = MagicMock(docstatus=1, status="Partially Paid", grand_total=500, outstanding_amount=300)
+		request.doctype = "Payment Request"
 		request.get.side_effect = lambda field, default=None: {
 			"status": "Partially Paid",
 			"grand_total": 500,
@@ -363,3 +364,15 @@ class TestStripeSettings(IntegrationTestCase):
 				}
 			)
 		self.assertEqual((data.amount, data.currency), (300, "NZD"))
+
+		# any other document with a total is paid through its Payment Request, which records it
+		order = MagicMock(doctype="Sales Order")
+		with patch("frappe.get_doc", return_value=order), self.assertRaises(frappe.ValidationError):
+			settings.create_request(
+				{
+					"amount": 0.5,
+					"currency": "nzd",
+					"reference_doctype": "Sales Order",
+					"reference_docname": "SO-1",
+				}
+			)
