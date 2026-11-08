@@ -20,6 +20,9 @@
 		<h4 class="text-center">
 			{{description}}
 		</h4>
+		{% if test_mode %}
+			<p class="text-center text-muted">{{ _("Test mode: use a Stripe test card. No money is charged.") }}</p>
+		{% endif %}
 		<form id="payment-form">
 			<div class="form-row row">
 				{% if not client_secret %}

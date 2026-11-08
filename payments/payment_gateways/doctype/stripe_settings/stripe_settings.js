@@ -3,6 +3,16 @@
 
 frappe.ui.form.on("Stripe Settings", {
 	refresh(frm) {
+		const key = frm.doc.publishable_key || "";
+		if (key.startsWith("pk_test_")) {
+			frm.page.set_indicator(__("Test mode"), "orange");
+			frm.dashboard.set_headline_alert(
+				__("Test mode: payments use Stripe's test cards and no money is charged."),
+				"orange"
+			);
+		} else if (key.startsWith("pk_live_")) {
+			frm.page.set_indicator(__("Live"), "green");
+		}
 		if (frm.is_new()) return;
 		const url = frappe.urllib.get_full_url(
 			"/api/method/payments.payment_gateways.doctype.stripe_settings.stripe_settings.webhook?gateway=" +

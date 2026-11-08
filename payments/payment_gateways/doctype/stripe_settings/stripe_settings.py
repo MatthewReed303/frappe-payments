@@ -86,6 +86,15 @@ def major_units(units: int, currency: str) -> float:
 	return flt(units) / (1000 if currency in THREE_DECIMAL_CURRENCIES else 100)
 
 
+def key_mode(key: str | None) -> str | None:
+	"""Whether a Stripe API key is a test or a live key: Stripe's test mode and sandboxes use the same
+	API with their own keys."""
+	for mode in ("test", "live"):
+		if (key or "").startswith((f"pk_{mode}_", f"sk_{mode}_", f"rk_{mode}_")):
+			return mode
+	return None
+
+
 class StripeSettings(Document):
 	supported_currencies = (
 		"AED",
@@ -205,6 +214,20 @@ class StripeSettings(Document):
 	)
 
 	currency_wise_minimum_charge_amount = MappingProxyType(currency_wise_minimum_charge_amount)
+
+	def validate(self):
+		secret = self.get_password(fieldname="secret_key", raise_exception=False)
+		modes = key_mode(self.publishable_key), key_mode(secret)
+		if all(modes) and modes[0] != modes[1]:
+			frappe.throw(
+				_(
+					"The Publishable Key is a {0} key and the Secret Key a {1} key. Use both from the same mode."
+				).format(_(modes[0]), _(modes[1]))
+			)
+
+	@property
+	def test_mode(self) -> bool:
+		return key_mode(self.publishable_key) == "test"
 
 	def on_update(self):
 		create_payment_gateway(

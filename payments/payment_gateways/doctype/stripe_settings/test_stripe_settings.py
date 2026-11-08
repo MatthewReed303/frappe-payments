@@ -5,6 +5,24 @@ from frappe.tests import IntegrationTestCase
 
 
 class TestStripeSettings(IntegrationTestCase):
+	def test_test_and_live_keys_cant_be_mixed(self):
+		from payments.payment_gateways.doctype.stripe_settings.stripe_settings import key_mode
+
+		self.assertEqual(key_mode("pk_test_x"), "test")
+		self.assertEqual(key_mode("sk_live_x"), "live")
+		self.assertEqual(key_mode("rk_test_x"), "test")
+		self.assertIsNone(key_mode(None))
+		settings = frappe.new_doc("Stripe Settings")
+		settings.update({"gateway_name": "Mixed", "publishable_key": "pk_test_x", "secret_key": "sk_live_x"})
+		self.assertRaises(frappe.ValidationError, settings.validate)
+		settings.secret_key = "sk_test_x"
+		settings.validate()
+		self.assertTrue(settings.test_mode)
+		settings.publishable_key = "pk_live_x"
+		settings.secret_key = "sk_live_x"
+		settings.validate()
+		self.assertFalse(settings.test_mode)
+
 	def test_failed_payment_redirect_message_starts_query_string(self):
 		controller = frappe.new_doc("Stripe Settings")
 		controller.data = frappe._dict(redirect_message="Card declined")

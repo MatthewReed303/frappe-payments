@@ -9,6 +9,7 @@ from frappe.utils import cint, fmt_money
 
 from payments.payment_gateways.doctype.stripe_settings.stripe_settings import (
 	get_gateway_controller,
+	key_mode,
 	major_units,
 )
 
@@ -38,6 +39,7 @@ def get_context(context):
 			context.reference_doctype, context.reference_docname, context.payment_gateway
 		)
 		context.publishable_key = get_api_key(context.reference_docname, gateway_controller)
+		context.test_mode = key_mode(context.publishable_key) == "test"
 		context.image = get_header_image(context.reference_docname, gateway_controller)
 
 		context["amount"] = fmt_money(amount=context["amount"], currency=context["currency"])
