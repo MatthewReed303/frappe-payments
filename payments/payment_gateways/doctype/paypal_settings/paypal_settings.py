@@ -703,7 +703,10 @@ class PayPalSettings(Document):
 	def finished(self, request) -> str | Message:
 		"""Where to send a payer coming back to a payment that's already settled."""
 		if request.status == "Completed":
-			return self.success_location(request)
+			# on as after paying: the document says where, and records the payment only once
+			reference = get_reference(request.reference_doctype, request.reference_docname)
+			redirect_to = reference.run_method("on_payment_authorized", "Completed") if reference else None
+			return self.success_location(request, redirect_to)
 		if request.status == "Cancelled":
 			return Message(_("Payment not taken"), _("This can no longer be paid. You haven't been charged."))
 		return "/payment-failed"
@@ -717,6 +720,18 @@ class PayPalSettings(Document):
 			"redirect_message": data.redirect_message,
 		}
 		return "/payment-success?" + urlencode({key: value for key, value in query.items() if value})
+
+	def refundable(self, paid) -> float:
+		"""What is left of a PayPal payment to refund, after refunds made here or in PayPal."""
+		order = self.api("GET", f"/v2/checkout/orders/{quote(paid.order, safe='')}")
+		payments = (order.get("purchase_units") or [{}])[0].get("payments") or {}
+		refunded = sum(
+			flt((refund.get("amount") or {}).get("value"))
+			for refund in payments.get("refunds") or []
+			if refund.get("status") in ("COMPLETED", "PENDING")
+			and up_link_id(refund, "/captures/") in (None, paid.capture)
+		)
+		return flt(paid.amount) - refunded
 
 	def refund(self, reference_doctype: str, reference_docname: str, amount: float, key: str) -> str:
 		"""Refund part or all of what a document's PayPal payment took, once per key (e.g. the
@@ -754,6 +769,13 @@ class PayPalSettings(Document):
 			if json.loads(made.data or "{}").get("key") == key:
 				return made.request_id
 		value = paypal_amount(amount, paid.currency)
+		left = self.refundable(paid)
+		if flt(value["value"]) > left + 0.005:
+			frappe.throw(
+				_(
+					"Only {0} of this PayPal payment can still be refunded: the rest was refunded in PayPal. Record that refund in ERPNext, then refund what is left."
+				).format(money(paypal_amount(left, paid.currency)))
+			)
 		refund = self.api(
 			"POST",
 			f"/v2/payments/captures/{quote(paid.capture, safe='')}/refund",
@@ -848,14 +870,16 @@ class PayPalSettings(Document):
 		"""Tell staff about money PayPal gave back from a payment that wasn't refunded here."""
 		if not request:
 			return None
+		# a refund made here is logged, and carries its own key; one made in PayPal carries the
+		# payment's (its document's name)
+		custom_id = resource.get("custom_id")
 		if kind == "PAYMENT.CAPTURE.REFUNDED" and (
-			resource.get("custom_id")
+			(custom_id and custom_id != request.reference_docname)
 			or frappe.db.exists(
 				"Integration Request",
 				{"integration_request_service": "PayPal", "request_id": resource.get("id")},
 			)
 		):
-			# refunded here, where it is recorded
 			return request.name
 		reference = get_reference(request.reference_doctype, request.reference_docname)
 		if not reference:

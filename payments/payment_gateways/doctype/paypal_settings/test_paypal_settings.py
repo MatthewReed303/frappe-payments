@@ -369,7 +369,7 @@ class TestPayPalSettings(unittest.TestCase):
 			# read before the payment was recorded, as by a request arriving at the same moment
 			self.assertTrue(settings.record_order(stale, state["order"]).startswith("/payment-success?"))
 
-		reference.run_method.assert_called_once_with("on_payment_authorized", "Completed")
+		reference.run_method.assert_any_call("on_payment_authorized", "Completed")
 		captures = fake.made("POST", "/v2/checkout/orders/ORDER-2/capture")
 		self.assertEqual(len(captures), 1)
 		self.assertTrue(captures[0].headers["PayPal-Request-Id"])
@@ -380,16 +380,24 @@ class TestPayPalSettings(unittest.TestCase):
 	def test_the_payer_coming_back_is_sent_on(self):
 		request = self.order_request(order_id="ORDER-3", status="Completed")
 		settings = self.settings()
+		reference = payment_request(self.reference_name, status="Paid")
+		reference.run_method.return_value = "/store/order-confirmation/SO-3"
 		get_doc = frappe.get_doc
-		with patch(
-			"frappe.get_doc",
-			side_effect=lambda *args, **kwargs: settings
-			if args[0] == "PayPal Settings"
-			else get_doc(*args, **kwargs),
+		with (
+			patch(
+				"frappe.get_doc",
+				side_effect=lambda *args, **kwargs: settings
+				if args[0] == "PayPal Settings"
+				else get_doc(*args, **kwargs),
+			),
+			patch.object(pp, "get_reference", return_value=reference),
 		):
 			pp.complete_payment(integration_request=request.name)
 		self.assertEqual(frappe.local.response["type"], "redirect")
 		self.assertIn("/payment-success?", frappe.local.response["location"])
+		# on to where the document sends a payer, as after paying
+		self.assertIn("order-confirmation", frappe.local.response["location"])
+		reference.run_method.assert_any_call("on_payment_authorized", "Completed")
 
 		pp.complete_payment(integration_request="_Test PayPal missing")
 		self.assertIn("/message?id=", frappe.local.response["location"])
@@ -538,14 +546,25 @@ class TestPayPalSettings(unittest.TestCase):
 		paid = self.order_request(
 			order_id="ORDER-11",
 			status="Completed",
-			output={"capture": "CAP-11", "currency": "NZD", "amount": 300},
+			output={"order": "ORDER-11", "capture": "CAP-11", "currency": "NZD", "amount": 300},
 		)
+		refunds = []
+
+		def refund(**kwargs):
+			made = {
+				"id": f"REF-{kwargs['json']['custom_id']}",
+				"status": "COMPLETED",
+				"amount": kwargs["json"]["amount"],
+			}
+			refunds.append(made)
+			return made
+
+		order = paypal_order("ORDER-11", "COMPLETED")
+		order["purchase_units"][0]["payments"] = {"refunds": refunds}
 		fake = FakePayPal(
 			{
-				("POST", "/v2/payments/captures/CAP-11/refund"): lambda **kwargs: {
-					"id": f"REF-{kwargs['json']['custom_id']}",
-					"status": "COMPLETED",
-				}
+				("GET", "/v2/checkout/orders/ORDER-11"): order,
+				("POST", "/v2/payments/captures/CAP-11/refund"): refund,
 			}
 		)
 		with patch.object(pp, "http_request", fake):
@@ -581,6 +600,16 @@ class TestPayPalSettings(unittest.TestCase):
 			with self.assertRaises(frappe.ValidationError):
 				settings.refund("Payment Request", "_Test PayPal PR-unpaid", 5, "CN-3")
 
+			# part was refunded in PayPal: no more than what is left is refunded here
+			refunds.append({"id": "REF-PAYPAL", "status": "COMPLETED", "amount": {"value": "250.00"}})
+			with self.assertRaises(frappe.ValidationError) as refused:
+				settings.refund("Payment Request", self.reference_name, 50, "CN-4")
+			self.assertIn("32.50", str(refused.exception))
+			self.assertEqual(len(fake.made("POST", "/v2/payments/captures/CAP-11/refund")), 2)
+			self.assertEqual(
+				settings.refund("Payment Request", self.reference_name, 32.5, "CN-4"), "REF-CN-4"
+			)
+
 	def test_refunds_made_in_paypal_reversals_and_disputes_are_noted_for_staff(self):
 		settings = self.settings()
 		self.order_request(order_id="ORDER-12", status="Completed", output={"capture": "CAP-12"})
@@ -595,6 +624,8 @@ class TestPayPalSettings(unittest.TestCase):
 		)
 		refund = {
 			"id": "REF-X",
+			# as PayPal sends it: a refund made in PayPal carries the payment's custom_id
+			"custom_id": self.reference_name,
 			"amount": {"currency_code": "NZD", "value": "20.00"},
 			"links": [{"rel": "up", "href": "https://api-m.sandbox.paypal.com/v2/payments/captures/CAP-12"}],
 		}
