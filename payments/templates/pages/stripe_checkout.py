@@ -51,6 +51,12 @@ def get_context(context):
 		elif frappe.get_meta(context.reference_doctype).has_field("grand_total"):
 			# a one-off payment: a PaymentIntent for what the document asks, so the bank can
 			# authenticate the payer (3-D Secure) and wallets work
+			if frappe.db.get_value(context.reference_doctype, context.reference_docname, "docstatus") == 2:
+				frappe.redirect_to_message(
+					_("Payment not available"), _("This payment was cancelled, so it can't be paid.")
+				)
+				frappe.local.flags.redirect_location = frappe.local.response.location
+				raise frappe.Redirect(302)
 			settings = frappe.get_doc("Stripe Settings", gateway_controller)
 			intent = settings.payment_intent(context.reference_doctype, context.reference_docname)
 			if intent.status == "succeeded":

@@ -108,6 +108,12 @@ extend_doctype_class = {"Web Form": "payments.overrides.payment_webform.PaymentW
 # 	}
 # }
 
+doc_events = {
+	"Payment Request": {
+		"on_cancel": "payments.payment_gateways.doctype.stripe_settings.stripe_settings.cancel_open_intent"
+	}
+}
+
 # Scheduled Tasks
 # ---------------
 

@@ -384,6 +384,19 @@ class StripeSettings(Document):
 			return None
 		request = frappe.get_doc("Integration Request", name)
 		reference = frappe.get_doc(reference_doctype, reference_docname)
+		if reference.docstatus == 2 and request.status != "Completed":
+			# paid in the moment the document was cancelled: kept for staff to refund or record
+			request.db_set(
+				{
+					"status": "Failed",
+					"error": _("Paid after {0} {1} was cancelled. Refund it in Stripe, or record it.").format(
+						_(reference_doctype), reference_docname
+					),
+				},
+				update_modified=False,
+			)
+			frappe.log_error(title="Stripe payment for a cancelled document", message=intent.id)
+			return None
 		if request.status == "Completed":
 			# recorded already: the document only says where the payer goes next
 			return reference.run_method("on_payment_authorized", "Completed")
@@ -436,6 +449,32 @@ class StripeSettings(Document):
 			request_id=refund.id,
 		)
 		return refund.id
+
+
+def cancel_open_intent(doc, method=None):
+	"""A cancelled document can't be paid: its PaymentIntent is cancelled at Stripe once the
+	cancel is saved."""
+	request = intent_request(doc.doctype, doc.name)
+	if request and request.status not in ("Completed", "Cancelled"):
+		frappe.enqueue(
+			"payments.payment_gateways.doctype.stripe_settings.stripe_settings.cancel_intent",
+			integration_request=request.name,
+			enqueue_after_commit=True,
+		)
+
+
+def cancel_intent(integration_request: str) -> None:
+	request = frappe.get_doc("Integration Request", integration_request)
+	gateway = frappe.db.get_value(request.reference_doctype, request.reference_docname, "payment_gateway")
+	controller = frappe.db.get_value("Payment Gateway", gateway, "gateway_controller") if gateway else None
+	if not controller or not frappe.db.exists("Stripe Settings", controller):
+		return
+	client = frappe.get_doc("Stripe Settings", controller).client()
+	intent = client.payment_intents.retrieve(request.request_id)
+	if intent.status in ("canceled", "succeeded"):
+		return
+	client.payment_intents.cancel(intent.id)
+	request.db_set("status", "Cancelled", update_modified=False)
 
 
 def intent_request(reference_doctype: str, reference_docname: str):

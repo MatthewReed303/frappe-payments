@@ -114,3 +114,117 @@ class TestStripeSettings(IntegrationTestCase):
 		self.assertEqual(frappe.local.flags.redirect_location, "/order/SO-1")
 		self.assertTrue(frappe.local.flags.commit)
 		frappe.local.flags.commit = False
+
+	def test_a_cancelled_payment_cant_be_paid(self):
+		from unittest.mock import MagicMock, patch
+
+		import frappe
+
+		from payments.templates.pages import stripe_checkout
+
+		settings = MagicMock()
+		form = dict.fromkeys(stripe_checkout.expected_keys, "x")
+		form.update(amount=10, currency="NZD", reference_doctype="Payment Request")
+		get_doc, get_value = frappe.get_doc, frappe.db.get_value
+		with (
+			patch.object(frappe.local, "form_dict", frappe._dict(form)),
+			patch.object(stripe_checkout, "get_gateway_controller", return_value="_Test Stripe"),
+			patch.object(stripe_checkout, "get_api_key", return_value="pk_test_x"),
+			patch.object(stripe_checkout, "get_header_image", return_value=None),
+			patch.object(stripe_checkout, "is_a_subscription", return_value=False),
+			patch(
+				"frappe.db.get_value",
+				side_effect=lambda *args, **kwargs: (
+					2 if args[:3] == ("Payment Request", "x", "docstatus") else get_value(*args, **kwargs)
+				),
+			),
+			patch(
+				"frappe.get_doc",
+				side_effect=lambda *args, **kwargs: (
+					settings if args[0] == "Stripe Settings" else get_doc(*args, **kwargs)
+				),
+			),
+			self.assertRaises(frappe.Redirect),
+		):
+			stripe_checkout.get_context(frappe._dict())
+		self.assertIn("/message", frappe.local.flags.redirect_location)
+		settings.payment_intent.assert_not_called()
+
+	def test_cancelling_a_document_cancels_its_open_intent(self):
+		from unittest.mock import MagicMock, patch
+
+		import frappe
+
+		from payments.payment_gateways.doctype.stripe_settings import stripe_settings
+
+		doc = frappe._dict(doctype="Payment Request", name="PR-1")
+		open_request = frappe._dict(name="IR-1", request_id="pi_test_1", status="Queued")
+		with (
+			patch.object(stripe_settings, "intent_request", return_value=open_request),
+			patch("frappe.enqueue") as enqueue,
+		):
+			stripe_settings.cancel_open_intent(doc)
+		self.assertEqual(enqueue.call_args.kwargs["integration_request"], "IR-1")
+		self.assertTrue(enqueue.call_args.kwargs["enqueue_after_commit"])
+		with (
+			patch.object(
+				stripe_settings, "intent_request", return_value=frappe._dict(open_request, status="Completed")
+			),
+			patch("frappe.enqueue") as enqueue,
+		):
+			stripe_settings.cancel_open_intent(doc)
+		enqueue.assert_not_called()
+
+		request = MagicMock(
+			reference_doctype="Payment Request", reference_docname="PR-1", request_id="pi_test_1"
+		)
+		client = MagicMock()
+		gateway = MagicMock()
+		gateway.client.return_value = client
+		for status, cancelled in (("requires_payment_method", True), ("succeeded", False)):
+			client.reset_mock()
+			client.payment_intents.retrieve.return_value = frappe._dict(id="pi_test_1", status=status)
+			with (
+				patch(
+					"frappe.get_doc",
+					side_effect=lambda doctype, name: request
+					if doctype == "Integration Request"
+					else gateway,
+				),
+				patch("frappe.db.get_value", return_value="_Test Stripe"),
+				patch("frappe.db.exists", return_value=True),
+			):
+				stripe_settings.cancel_intent("IR-1")
+			self.assertEqual(client.payment_intents.cancel.called, cancelled)
+
+	def test_a_payment_for_a_cancelled_document_is_kept_for_staff(self):
+		from unittest.mock import MagicMock, patch
+
+		import frappe
+
+		from payments.payment_gateways.doctype.stripe_settings import stripe_settings
+
+		request = MagicMock(status="Queued")
+		reference = MagicMock(docstatus=2)
+		intent = frappe._dict(
+			id="pi_test_1",
+			status="succeeded",
+			metadata={
+				"reference_doctype": "Payment Request",
+				"reference_docname": "PR-1",
+				"site": frappe.local.site,
+			},
+		)
+		settings = frappe.new_doc("Stripe Settings")
+		with (
+			patch("frappe.db.get_value", return_value="IR-1"),
+			patch(
+				"frappe.get_doc",
+				side_effect=lambda doctype, name: request if doctype == "Integration Request" else reference,
+			),
+			patch("frappe.log_error") as log_error,
+		):
+			self.assertIsNone(settings.record_payment_intent(intent))
+		self.assertEqual(request.db_set.call_args.args[0]["status"], "Failed")
+		reference.run_method.assert_not_called()
+		log_error.assert_called_once()
