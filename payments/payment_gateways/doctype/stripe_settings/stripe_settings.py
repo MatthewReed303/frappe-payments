@@ -656,10 +656,29 @@ def amount_to_pay(reference) -> tuple[float, str]:
 		frappe.throw(_("{0} {1} has nothing left to pay").format(_(reference.doctype), reference.name))
 	amount = reference.get("grand_total")
 	if reference.meta.has_field("outstanding_amount") and reference.get("outstanding_amount") is not None:
-		amount = reference.outstanding_amount
+		amount = in_request_currency(reference, flt(reference.outstanding_amount))
 	if flt(amount) <= 0:
 		frappe.throw(_("{0} {1} has nothing left to pay").format(_(reference.doctype), reference.name))
 	return flt(amount), reference.get("currency")
+
+
+def in_request_currency(reference, outstanding: float) -> float:
+	"""What a Payment Request still asks, in its own currency: ERPNext keeps it in the currency of
+	the party's account, which can differ (an order in USD for a customer whose account is in NZD)."""
+	party_currency = reference.get("party_account_currency")
+	if not party_currency or party_currency == reference.get("currency"):
+		return outstanding
+	try:
+		from erpnext.accounts.doctype.payment_request.payment_request import (
+			get_requested_amount_in_party_account_currency,
+		)
+	except ImportError:
+		return outstanding
+	requested = flt(get_requested_amount_in_party_account_currency(reference))
+	if not requested:
+		return outstanding
+	total = flt(reference.get("grand_total"))
+	return min(flt(total * outstanding / requested, 2), total)
 
 
 def tell_staff(reference, note: str) -> None:
