@@ -252,6 +252,11 @@ class StripeSettings(Document):
 		import stripe
 
 		self.data = frappe._dict(data)
+		if self.data.reference_doctype and self.data.reference_docname:
+			reference = frappe.get_doc(self.data.reference_doctype, self.data.reference_docname)
+			if reference.meta.has_field("grand_total"):
+				# what the document asks, never what the browser sent
+				self.data.amount, self.data.currency = amount_to_pay(reference)
 		stripe.api_key = self.get_password(fieldname="secret_key", raise_exception=False)
 		stripe.default_http_client = stripe.http_client.RequestsClient()
 
@@ -276,7 +281,7 @@ class StripeSettings(Document):
 
 		try:
 			charge = stripe.Charge.create(
-				amount=cint(flt(self.data.amount) * 100),
+				amount=minor_units(self.data.amount, self.data.currency),
 				currency=self.data.currency,
 				source=self.data.stripe_token_id,
 				description=self.data.description,
@@ -339,23 +344,31 @@ class StripeSettings(Document):
 		return stripe.StripeClient(self.get_password(fieldname="secret_key", raise_exception=False))
 
 	def payment_intent(self, reference_doctype: str, reference_docname: str):
-		"""The PaymentIntent paying a document (usually a Payment Request), for its grand total in
+		"""The PaymentIntent paying a document (usually a Payment Request), for what it still asks in
 		its currency. It is made once and reused while the document is unpaid."""
 		reference = frappe.get_doc(reference_doctype, reference_docname)
-		amount, currency = flt(reference.get("grand_total")), reference.get("currency")
+		client = self.client()
+		existing = intent_request(reference_doctype, reference_docname)
+		intent = client.payment_intents.retrieve(existing.request_id) if existing else None
+		if intent and intent.status == "succeeded":
+			return intent
+		amount, currency = amount_to_pay(reference)
 		self.validate_transaction_currency(currency)
 		self.validate_minimum_transaction_amount(currency, amount)
 		units = minor_units(amount, currency)
-		client = self.client()
-		existing = intent_request(reference_doctype, reference_docname)
-		if existing:
-			intent = client.payment_intents.retrieve(existing.request_id)
-			if intent.status not in ("canceled", "succeeded") and intent.currency == currency.lower():
-				if intent.amount != units and intent.status != "processing":
-					intent = client.payment_intents.update(intent.id, params={"amount": units})
-				return intent
-			if intent.status == "succeeded":
-				return intent
+		if intent and intent.status != "canceled" and intent.currency == currency.lower():
+			if intent.amount != units and intent.status != "processing":
+				intent = client.payment_intents.update(intent.id, params={"amount": units})
+			return intent
+		attempt = frappe.db.count(
+			"Integration Request",
+			{
+				"integration_request_service": "Stripe",
+				"reference_doctype": reference_doctype,
+				"reference_docname": reference_docname,
+				"request_id": ["like", "pi_%"],
+			},
+		)
 		intent = client.payment_intents.create(
 			params={
 				"amount": units,
@@ -372,7 +385,7 @@ class StripeSettings(Document):
 				},
 			},
 			options={
-				"idempotency_key": f"{frappe.local.site}:{reference_doctype}:{reference_docname}:{units}"
+				"idempotency_key": f"{frappe.local.site}:{reference_doctype}:{reference_docname}:{units}:{attempt}"
 			},
 		)
 		create_request_log(
@@ -394,15 +407,19 @@ class StripeSettings(Document):
 		)
 		if intent.status != "succeeded" or metadata.get("site") != frappe.local.site:
 			return None
-		name = frappe.db.get_value(
+		# the status is read with the lock: a plain read can see the moment before the webhook or the
+		# payer's return recorded the same payment
+		locked = frappe.db.get_value(
 			"Integration Request",
 			{"integration_request_service": "Stripe", "request_id": intent.id},
-			"name",
+			["name", "status"],
+			as_dict=True,
 			for_update=True,
 		)
-		if not name:
+		if not locked:
 			return None
-		request = frappe.get_doc("Integration Request", name)
+		request = frappe.get_doc("Integration Request", locked.name)
+		request.status = locked.status
 		reference = frappe.get_doc(reference_doctype, reference_docname)
 		if reference.docstatus == 2 and request.status != "Completed":
 			# paid in the moment the document was cancelled: kept for staff to refund or record
@@ -416,14 +433,31 @@ class StripeSettings(Document):
 				update_modified=False,
 			)
 			frappe.log_error(title="Stripe payment for a cancelled document", message=intent.id)
-			return None
+			note = _(
+				"A card payment of {0} came in after {1} {2} was cancelled. Refund it in Stripe, or record it."
+			).format(
+				fmt_money(
+					major_units(intent.amount_received, intent.currency), currency=intent.currency.upper()
+				),
+				_(reference_doctype),
+				reference_docname,
+			)
+			tell_staff(reference, note)
+			return frappe.redirect_to_message(
+				_("Payment received after cancellation"),
+				_(
+					"Your payment came in after this was cancelled. We've told our team, and they'll refund it."
+				),
+			)
 		if request.status == "Completed":
 			# recorded already: the document only says where the payer goes next
 			return reference.run_method("on_payment_authorized", "Completed")
-		if intent.currency != (
-			reference.get("currency") or ""
-		).lower() or intent.amount_received < minor_units(
-			reference.get("grand_total"), reference.get("currency")
+		# intents are only made here, for what the document still asked, so the payment must be the
+		# intent's whole amount, no more than the document's total
+		if (
+			intent.currency != (reference.get("currency") or "").lower()
+			or intent.amount_received < intent.amount
+			or intent.amount > minor_units(reference.get("grand_total"), reference.get("currency"))
 		):
 			request.db_set(
 				{"status": "Failed", "error": _("The amount paid doesn't match")}, update_modified=False
@@ -563,7 +597,7 @@ def record_dispute(dispute) -> None:
 		note = _("The dispute over {0} was closed in your favour: the payment stands.").format(amount)
 	elif dispute.status == "lost":
 		note = _(
-			"The customer won their dispute over {0}: Stripe has taken the money back, with its dispute fee. Record it in ERPNext, for example with a credit note."
+			"The customer won their dispute over {0}: Stripe has taken the money back, with its dispute fee. Record the loss in ERPNext, and don't refund it again."
 		).format(amount)
 	else:
 		due = (dispute.get("evidence_details") or {}).get("due_by")
@@ -578,7 +612,24 @@ def record_dispute(dispute) -> None:
 			if due
 			else _("the date Stripe gives"),
 		)
-	reference = frappe.get_doc(paid.reference_doctype, paid.reference_docname)
+	tell_staff(frappe.get_doc(paid.reference_doctype, paid.reference_docname), note)
+
+
+def amount_to_pay(reference) -> tuple[float, str]:
+	"""What a document still asks to be paid, in its currency."""
+	if reference.docstatus != 1 or reference.get("status") in ("Paid", "Cancelled"):
+		frappe.throw(_("{0} {1} has nothing left to pay").format(_(reference.doctype), reference.name))
+	amount = reference.get("grand_total")
+	if reference.meta.has_field("outstanding_amount") and reference.get("outstanding_amount") is not None:
+		amount = reference.outstanding_amount
+	if flt(amount) <= 0:
+		frappe.throw(_("{0} {1} has nothing left to pay").format(_(reference.doctype), reference.name))
+	return flt(amount), reference.get("currency")
+
+
+def tell_staff(reference, note: str) -> None:
+	"""Note something about a payment on its document (and the document that asks for it), and
+	notify Accounts Managers."""
 	documents = [reference]
 	if reference.get("reference_doctype") and reference.get("reference_name"):
 		documents.append(frappe.get_doc(reference.reference_doctype, reference.reference_name))

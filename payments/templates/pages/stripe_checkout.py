@@ -48,9 +48,10 @@ def get_context(context):
 			recurrence = frappe.db.get_value("Payment Plan", payment_plan, "recurrence")
 
 			context["amount"] = context["amount"] + " " + _(recurrence)
-		elif frappe.get_meta(context.reference_doctype).has_field("grand_total"):
-			# a one-off payment: a PaymentIntent for what the document asks, so the bank can
-			# authenticate the payer (3-D Secure) and wallets work
+		elif context.reference_doctype == "Payment Request":
+			# a one-off payment: a PaymentIntent for what the request asks, so the bank can
+			# authenticate the payer (3-D Secure) and wallets work. Only a Payment Request, which is
+			# made to be paid by whoever has its link, is looked up from the link.
 			if frappe.db.get_value(context.reference_doctype, context.reference_docname, "docstatus") == 2:
 				frappe.redirect_to_message(
 					_("Payment not available"), _("This payment was cancelled, so it can't be paid.")
@@ -58,7 +59,13 @@ def get_context(context):
 				frappe.local.flags.redirect_location = frappe.local.response.location
 				raise frappe.Redirect(302)
 			settings = frappe.get_doc("Stripe Settings", gateway_controller)
-			intent = settings.payment_intent(context.reference_doctype, context.reference_docname)
+			try:
+				intent = settings.payment_intent(context.reference_doctype, context.reference_docname)
+			except frappe.ValidationError:
+				frappe.clear_messages()
+				frappe.redirect_to_message(_("Payment not available"), _("There's nothing left to pay here."))
+				frappe.local.flags.redirect_location = frappe.local.response.location
+				raise frappe.Redirect(302)
 			if intent.status == "succeeded":
 				# paid already (the payer came back to this page): recorded once, then on as after paying
 				frappe.local.flags.commit = True
