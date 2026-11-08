@@ -1354,11 +1354,16 @@ def tell_staff(reference, note: str) -> None:
 	documents = [reference]
 	if reference.get("reference_doctype") and reference.get("reference_name"):
 		documents.append(frappe.get_doc(reference.reference_doctype, reference.reference_name))
+	noted = False
 	for doc in documents:
 		if not frappe.db.exists(
 			"Comment", {"reference_doctype": doc.doctype, "reference_name": doc.name, "content": note}
 		):
 			doc.add_comment("Info", note)
+			noted = True
+	if not noted:
+		# told already: the gateway sent the same news again
+		return
 	staff = frappe.get_all(
 		"Has Role",
 		filters={
