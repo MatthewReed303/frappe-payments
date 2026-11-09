@@ -6,15 +6,25 @@ from frappe.desk.doctype.notification_log.notification_log import enqueue_create
 from frappe.utils import flt
 
 
+class NothingToPay(frappe.ValidationError):
+	"""A document can't be paid: it is paid, cancelled or asks for nothing."""
+
+
 def amount_to_pay(reference) -> tuple[float, str]:
 	"""What a document still asks to be paid, in its currency."""
 	if reference.docstatus != 1 or reference.get("status") in ("Paid", "Cancelled"):
-		frappe.throw(_("{0} {1} has nothing left to pay").format(_(reference.doctype), reference.name))
+		frappe.throw(
+			_("{0} {1} has nothing left to pay").format(_(reference.doctype), reference.name),
+			exc=NothingToPay,
+		)
 	amount = reference.get("grand_total")
 	if reference.meta.has_field("outstanding_amount") and reference.get("outstanding_amount") is not None:
 		amount = in_request_currency(reference, flt(reference.outstanding_amount))
 	if flt(amount) <= 0:
-		frappe.throw(_("{0} {1} has nothing left to pay").format(_(reference.doctype), reference.name))
+		frappe.throw(
+			_("{0} {1} has nothing left to pay").format(_(reference.doctype), reference.name),
+			exc=NothingToPay,
+		)
 	return flt(amount), reference.get("currency")
 
 

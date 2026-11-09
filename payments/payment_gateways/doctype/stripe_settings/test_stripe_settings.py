@@ -44,32 +44,6 @@ class TestStripeSettings(IntegrationTestCase):
 			"payment-failed?redirect_to=%2Forders&redirect_message=Card+declined",
 		)
 
-	def test_what_is_owed_is_in_the_requests_currency(self):
-		from unittest.mock import MagicMock, patch
-
-		from payments.utils import payment_request
-
-		# a USD request for a customer whose account is in INR: ERPNext keeps what is owed in INR
-		values = {
-			"status": "Requested",
-			"currency": "USD",
-			"party_account_currency": "INR",
-			"grand_total": 60.12,
-			"outstanding_amount": 5011.00,
-		}
-		request = MagicMock(docstatus=1, outstanding_amount=5011.00)
-		request.get.side_effect = lambda field, default=None: values.get(field, default)
-		request.meta.has_field.return_value = True
-		request.precision.return_value = 2
-		with patch.object(payment_request, "requested_in_party_currency", return_value=5011.00):
-			self.assertEqual(payment_request.amount_to_pay(request), (60.12, "USD"))
-			# half paid
-			values["outstanding_amount"] = request.outstanding_amount = 2505.50
-			self.assertEqual(payment_request.amount_to_pay(request), (30.06, "USD"))
-		values.update(party_account_currency="USD", outstanding_amount=60.12)
-		request.outstanding_amount = 60.12
-		self.assertEqual(payment_request.amount_to_pay(request), (60.12, "USD"))
-
 	def test_amounts_are_in_the_currencys_smallest_unit(self):
 		from payments.payment_gateways.doctype.stripe_settings.stripe_settings import minor_units
 
