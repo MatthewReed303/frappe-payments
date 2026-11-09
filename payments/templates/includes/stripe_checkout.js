@@ -1,9 +1,9 @@
-var stripe = Stripe("{{ publishable_key }}");
+var stripe = Stripe({{ publishable_key|tojson }});
 {% if client_secret %}
 // One-off payments: Stripe's Payment Element confirms a PaymentIntent, with 3-D Secure when the
 // payer's bank asks for it, then the site checks the payment with Stripe and records it.
-var elements = stripe.elements({ clientSecret: "{{ client_secret }}" });
-var payment = elements.create("payment", { defaultValues: { billingDetails: { name: "{{ payer_name }}", email: "{{ payer_email }}" } } });
+var elements = stripe.elements({ clientSecret: {{ client_secret|tojson }} });
+var payment = elements.create("payment", { defaultValues: { billingDetails: { name: {{ payer_name|tojson }}, email: {{ payer_email|tojson }} } } });
 payment.mount("#card-element");
 
 function showOutcome(message, failed) {
@@ -17,9 +17,9 @@ function recordPayment(paymentIntent) {
 		freeze: true,
 		args: {
 			payment_intent: paymentIntent,
-			reference_doctype: "{{ reference_doctype }}",
-			reference_docname: "{{ reference_docname }}",
-			payment_gateway: "{{ payment_gateway }}",
+			reference_doctype: {{ reference_doctype|tojson }},
+			reference_docname: {{ reference_docname|tojson }},
+			payment_gateway: {{ payment_gateway|tojson }},
 		},
 	}).then(function (r) {
 		var result = r.message || {};
@@ -96,10 +96,10 @@ function setOutcome(result) {
 			headers: {"X-Requested-With": "XMLHttpRequest"},
 			args: {
 				"stripe_token_id": result.token.id,
-				"data": JSON.stringify({{ frappe.form_dict|json }}),
-				"reference_doctype": "{{ reference_doctype }}",
-				"reference_docname": "{{ reference_docname }}",
-				"payment_gateway": "{{ payment_gateway }}"
+				"data": JSON.stringify({{ frappe.form_dict|tojson }}),
+				"reference_doctype": {{ reference_doctype|tojson }},
+				"reference_docname": {{ reference_docname|tojson }},
+				"payment_gateway": {{ payment_gateway|tojson }}
 			},
 			callback: function(r) {
 				if (r.message.status == "Completed") {
