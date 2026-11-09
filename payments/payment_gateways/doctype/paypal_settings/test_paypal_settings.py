@@ -1,10 +1,10 @@
 # Copyright (c) 2026, Frappe Technologies and Contributors
 # License: MIT. See LICENSE
 import json
-import unittest
 from unittest.mock import MagicMock, patch
 
 import frappe
+from frappe.tests import IntegrationTestCase
 
 from payments.payment_gateways.doctype.paypal_settings import paypal_settings as pp
 
@@ -44,7 +44,7 @@ def no_network(method, url, **kwargs):
 	raise AssertionError(f"PayPal was called in a test: {method} {url}")
 
 
-def paypal_order(order_id, status="APPROVED", value="300.00", currency="NZD", capture=None):
+def paypal_order(order_id, status="APPROVED", value="300.00", currency="USD", capture=None):
 	unit = {"reference_id": "PR", "amount": {"currency_code": currency, "value": value}}
 	if capture:
 		unit["payments"] = {"captures": [capture]}
@@ -63,7 +63,7 @@ def paypal_order(order_id, status="APPROVED", value="300.00", currency="NZD", ca
 	}
 
 
-def captured(order_id, value="300.00", currency="NZD", status="COMPLETED", unit_value=None):
+def captured(order_id, value="300.00", currency="USD", status="COMPLETED", unit_value=None):
 	return paypal_order(
 		order_id,
 		"COMPLETED",
@@ -77,12 +77,21 @@ def captured(order_id, value="300.00", currency="NZD", status="COMPLETED", unit_
 	)
 
 
-def payment_request(name, docstatus=1, status="Requested", grand_total=500, outstanding=300, currency="NZD"):
+def payment_request(
+	name,
+	docstatus=1,
+	status="Requested",
+	grand_total=500,
+	outstanding=300,
+	currency="USD",
+	email_to="payer@example.com",
+):
 	values = {
 		"status": status,
 		"grand_total": grand_total,
 		"outstanding_amount": outstanding,
 		"currency": currency,
+		"email_to": email_to,
 	}
 	request = MagicMock(docstatus=docstatus, outstanding_amount=outstanding)
 	request.doctype, request.name = "Payment Request", name
@@ -92,35 +101,7 @@ def payment_request(name, docstatus=1, status="Requested", grand_total=500, outs
 	return request
 
 
-class TestPayPalSettings(unittest.TestCase):
-	def test_what_is_owed_is_in_the_requests_currency(self):
-		from unittest.mock import MagicMock, patch
-
-		from payments.payment_gateways.doctype.paypal_settings import paypal_settings as gateway
-
-		# a USD order for a customer whose account is in NZD: ERPNext keeps what is owed in NZD
-		values = {
-			"status": "Requested",
-			"currency": "USD",
-			"party_account_currency": "NZD",
-			"grand_total": 60.12,
-			"outstanding_amount": 107.70,
-		}
-		request = MagicMock(docstatus=1, outstanding_amount=107.70)
-		request.get.side_effect = lambda field, default=None: values.get(field, default)
-		request.meta.has_field.return_value = True
-		with patch(
-			"erpnext.accounts.doctype.payment_request.payment_request.get_requested_amount_in_party_account_currency",
-			return_value=107.70,
-		):
-			self.assertEqual(gateway.amount_to_pay(request), (60.12, "USD"))
-			# half paid
-			values["outstanding_amount"] = request.outstanding_amount = 53.85
-			self.assertEqual(gateway.amount_to_pay(request), (30.06, "USD"))
-		values.update(party_account_currency="USD", outstanding_amount=60.12)
-		request.outstanding_amount = 60.12
-		self.assertEqual(gateway.amount_to_pay(request), (60.12, "USD"))
-
+class TestPayPalSettings(IntegrationTestCase):
 	def setUp(self):
 		self.started = frappe.utils.now_datetime()
 		self.client_ids = []
@@ -165,7 +146,7 @@ class TestPayPalSettings(unittest.TestCase):
 				"reference_doctype": "Payment Request",
 				"reference_docname": self.reference_name,
 				"request_id": order_id,
-				"data": frappe.as_json(data or {"amount": 0.5, "currency": "NZD"}),
+				"data": frappe.as_json(data or {"amount": 0.5, "currency": "USD"}),
 				"output": frappe.as_json(output) if output else None,
 			}
 		)
@@ -228,7 +209,7 @@ class TestPayPalSettings(unittest.TestCase):
 		self.assertEqual(pp.paypal_amount(1000.4, "jpy"), {"currency_code": "JPY", "value": "1000"})
 		self.assertEqual(pp.paypal_amount(2500.5, "HUF")["value"], "2501")
 		self.assertEqual(pp.paypal_amount(99, "TWD")["value"], "99")
-		self.assertEqual(pp.paypal_amount(12.5, "NZD")["value"], "12.50")
+		self.assertEqual(pp.paypal_amount(12.5, "USD")["value"], "12.50")
 		self.assertEqual(pp.paypal_amount(0.005, "USD")["value"], "0.01")
 		self.assertTrue(
 			pp.same_amount(
@@ -292,7 +273,7 @@ class TestPayPalSettings(unittest.TestCase):
 		):
 			url = settings.get_payment_url(
 				amount=300,
-				currency="NZD",
+				currency="USD",
 				reference_doctype="Payment Request",
 				reference_docname="_Test PR Submitting",
 			)
@@ -307,9 +288,10 @@ class TestPayPalSettings(unittest.TestCase):
 		request = self.order_request(
 			data={
 				"amount": 0.5,
-				"currency": "NZD",
+				"currency": "USD",
 				"title": "_Test Company",
-				"payer_email": "payer@example.com",
+				# ERPNext names the user who made the request when it has no email
+				"payer_email": "staff@example.com",
 			}
 		)
 		reference = payment_request(self.reference_name, grand_total=500, outstanding=300)
@@ -324,7 +306,7 @@ class TestPayPalSettings(unittest.TestCase):
 			body = created[0].json
 			unit = body["purchase_units"][0]
 			self.assertEqual(body["intent"], "CAPTURE")
-			self.assertEqual(unit["amount"], {"currency_code": "NZD", "value": "300.00"})
+			self.assertEqual(unit["amount"], {"currency_code": "USD", "value": "300.00"})
 			self.assertEqual(
 				(unit["custom_id"], unit["invoice_id"]), (self.reference_name, self.reference_name)
 			)
@@ -397,7 +379,7 @@ class TestPayPalSettings(unittest.TestCase):
 			# read before the payment was recorded, as by a request arriving at the same moment
 			self.assertTrue(settings.record_order(stale, state["order"]).startswith("/payment-success?"))
 
-		reference.run_method.assert_any_call("on_payment_authorized", "Completed")
+		reference.run_method.assert_called_once_with("on_payment_authorized", "Completed")
 		captures = fake.made("POST", "/v2/checkout/orders/ORDER-2/capture")
 		self.assertEqual(len(captures), 1)
 		self.assertTrue(captures[0].headers["PayPal-Request-Id"])
@@ -406,10 +388,13 @@ class TestPayPalSettings(unittest.TestCase):
 		self.assertEqual(json.loads(request.output)["capture"], "CAP-ORDER-2")
 
 	def test_the_payer_coming_back_is_sent_on(self):
-		request = self.order_request(order_id="ORDER-3", status="Completed")
+		request = self.order_request(
+			order_id="ORDER-3",
+			status="Completed",
+			output={"capture": "CAP-3", "redirect_to": "/store/order-confirmation/SO-3"},
+		)
 		settings = self.settings()
 		reference = payment_request(self.reference_name, status="Paid")
-		reference.run_method.return_value = "/store/order-confirmation/SO-3"
 		get_doc = frappe.get_doc
 		with (
 			patch(
@@ -423,9 +408,9 @@ class TestPayPalSettings(unittest.TestCase):
 			pp.complete_payment(integration_request=request.name)
 		self.assertEqual(frappe.local.response["type"], "redirect")
 		self.assertIn("/payment-success?", frappe.local.response["location"])
-		# on to where the document sends a payer, as after paying
+		# on to where the document sent the payer after paying, without recording it again
 		self.assertIn("order-confirmation", frappe.local.response["location"])
-		reference.run_method.assert_any_call("on_payment_authorized", "Completed")
+		reference.run_method.assert_not_called()
 
 		pp.complete_payment(integration_request="_Test PayPal missing")
 		self.assertIn("/message?id=", frappe.local.response["location"])
@@ -578,13 +563,13 @@ class TestPayPalSettings(unittest.TestCase):
 		paid = self.order_request(
 			order_id="ORDER-11",
 			status="Completed",
-			output={"order": "ORDER-11", "capture": "CAP-11", "currency": "NZD", "amount": 300},
+			output={"order": "ORDER-11", "capture": "CAP-11", "currency": "USD", "amount": 300},
 		)
 		refunds = []
 
 		def refund(**kwargs):
 			made = {
-				"id": f"REF-{kwargs['json']['custom_id']}",
+				"id": f"REF-{kwargs['json']['custom_id'].removeprefix(pp.REFUND_MARK)}",
 				"status": "COMPLETED",
 				"amount": kwargs["json"]["amount"],
 			}
@@ -605,7 +590,8 @@ class TestPayPalSettings(unittest.TestCase):
 			)
 			made = fake.made("POST", "/v2/payments/captures/CAP-11/refund")
 			self.assertEqual(
-				made[0].json, {"amount": {"currency_code": "NZD", "value": "12.50"}, "custom_id": "CN-1"}
+				made[0].json,
+				{"amount": {"currency_code": "USD", "value": "12.50"}, "custom_id": "refund:CN-1"},
 			)
 			self.assertTrue(made[0].headers["PayPal-Request-Id"])
 			self.assertTrue(
@@ -631,6 +617,14 @@ class TestPayPalSettings(unittest.TestCase):
 
 			with self.assertRaises(frappe.ValidationError):
 				settings.refund("Payment Request", "_Test PayPal PR-unpaid", 5, "CN-3")
+			with self.assertRaises(frappe.ValidationError):
+				settings.refund("Payment Request", self.reference_name, 0, "CN-5")
+			frappe.set_user("Guest")
+			try:
+				with self.assertRaises(frappe.PermissionError):
+					settings.refund("Payment Request", self.reference_name, 5, "CN-6")
+			finally:
+				frappe.set_user("Administrator")
 
 			# part was refunded in PayPal: no more than what is left is refunded here
 			refunds.append({"id": "REF-PAYPAL", "status": "COMPLETED", "amount": {"value": "250.00"}})
@@ -658,14 +652,14 @@ class TestPayPalSettings(unittest.TestCase):
 			"id": "REF-X",
 			# as PayPal sends it: a refund made in PayPal carries the payment's custom_id
 			"custom_id": self.reference_name,
-			"amount": {"currency_code": "NZD", "value": "20.00"},
+			"amount": {"currency_code": "USD", "value": "20.00"},
 			"links": [{"rel": "up", "href": "https://api-m.sandbox.paypal.com/v2/payments/captures/CAP-12"}],
 		}
 		dispute = {
 			"dispute_id": "PP-D-1",
 			"disputed_transactions": [{"seller_transaction_id": "CAP-12"}],
 			"reason": "MERCHANDISE_OR_SERVICE_NOT_RECEIVED",
-			"dispute_amount": {"currency_code": "NZD", "value": "300.00"},
+			"dispute_amount": {"currency_code": "USD", "value": "300.00"},
 			"seller_response_due_date": "2026-11-20T23:59:59.000Z",
 		}
 		with (
@@ -677,11 +671,16 @@ class TestPayPalSettings(unittest.TestCase):
 			self.assertIn("20.00", tell_staff.call_args.args[1])
 			self.assertIn("refunded in PayPal", tell_staff.call_args.args[1])
 
-			# a refund made here is recorded here
+			# a refund made here is recorded here, even when its key is the document's name and its
+			# news comes before it is logged
 			tell_staff.reset_mock()
-			settings.handle_event(
-				{"event_type": "PAYMENT.CAPTURE.REFUNDED", "resource": dict(refund, custom_id="CN-1")}
-			)
+			for key in ("CN-1", self.reference_name):
+				settings.handle_event(
+					{
+						"event_type": "PAYMENT.CAPTURE.REFUNDED",
+						"resource": dict(refund, id=f"REF-{key}", custom_id=pp.refund_mark(key)),
+					}
+				)
 			tell_staff.assert_not_called()
 
 			settings.handle_event({"event_type": "PAYMENT.CAPTURE.REVERSED", "resource": refund})
@@ -700,3 +699,48 @@ class TestPayPalSettings(unittest.TestCase):
 			self.assertIn("in your favour", tell_staff.call_args.args[1])
 		reference.run_method.assert_not_called()
 		self.assertFalse([call for call in fake.calls if call.method == "POST" and "refund" in call.path])
+
+	def test_a_payment_request_can_be_paid_again_after_an_attempt_that_took_nothing(self):
+		settings = self.settings()
+		declined = self.order_request(
+			order_id="ORDER-20", status="Failed", output={"capture": "CAP-20", "status": "DECLINED"}
+		)
+		reference = payment_request(self.reference_name)
+		fake = FakePayPal(
+			{("POST", "/v2/checkout/orders"): paypal_order("ORDER-21", "PAYER_ACTION_REQUIRED")}
+		)
+		asked = []
+
+		def order_request_for(details):
+			asked.append(details)
+			return self.order_request().name
+
+		with (
+			patch.object(pp, "http_request", fake),
+			patch.object(pp, "get_reference", return_value=reference),
+			patch.object(settings, "order_request_for", side_effect=order_request_for),
+		):
+			location = settings.checkout(pp.order_request(name=declined.name))
+		self.assertEqual(
+			(asked[0]["reference_doctype"], asked[0]["reference_docname"]),
+			("Payment Request", self.reference_name),
+		)
+		self.assertEqual(location, "https://www.sandbox.paypal.com/checkoutnow?token=ORDER-21")
+		fresh = frappe.db.get_value(
+			"Integration Request",
+			{"request_id": "ORDER-21", "integration_request_service": "PayPal"},
+			["name", "status"],
+			as_dict=True,
+		)
+		self.assertEqual(fresh.status, "Queued")
+		self.assertNotEqual(fresh.name, declined.name)
+
+		# money taken that couldn't be recorded is left for staff, not asked for again
+		kept = self.order_request(
+			order_id="ORDER-22", status="Failed", output={"capture": "CAP-22", "status": "COMPLETED"}
+		)
+		with (
+			patch.object(pp, "http_request", FakePayPal()),
+			patch.object(pp, "get_reference", return_value=reference),
+		):
+			self.assertEqual(settings.checkout(pp.order_request(name=kept.name)), "/payment-failed")

@@ -80,7 +80,6 @@ from zoneinfo import ZoneInfo
 import frappe
 import requests
 from frappe import _
-from frappe.desk.doctype.notification_log.notification_log import enqueue_create_notification
 from frappe.integrations.utils import create_request_log, make_post_request
 from frappe.model.document import Document
 from frappe.utils import (
@@ -99,6 +98,7 @@ from frappe.utils import (
 from frappe.utils.data import get_system_timezone
 
 from payments.utils import create_payment_gateway
+from payments.utils.payment_request import NothingToPay, amount_to_pay, tell_staff
 
 api_path = "/api/method/payments.payment_gateways.doctype.paypal_settings.paypal_settings"
 
@@ -137,8 +137,7 @@ class PayPalError(frappe.ValidationError):
 		)
 
 
-class NotPayable(frappe.ValidationError):
-	pass
+NotPayable = NothingToPay
 
 
 class Message(NamedTuple):
@@ -426,14 +425,7 @@ class PayPalSettings(Document):
 		data = frappe._dict(details)
 		if data.reference_doctype and data.reference_docname:
 			reference = get_reference(data.reference_doctype, data.reference_docname)
-			if reference and reference.meta.has_field("grand_total"):
-				if reference.doctype != "Payment Request":
-					# only a Payment Request records what is paid for a document with a total
-					frappe.throw(
-						_("Pay {0} {1} through its Payment Request").format(
-							_(reference.doctype), reference.name
-						)
-					)
+			if reference and reference.doctype == "Payment Request":
 				if reference.docstatus:
 					data.amount, data.currency = amount_to_pay(reference)
 				# else ERPNext asks for the link while submitting the request; what is owed is checked
@@ -476,7 +468,7 @@ class PayPalSettings(Document):
 		what it still asks."""
 		data = frappe._dict(json.loads(request.data or "{}"))
 		reference = get_reference(request.reference_doctype, request.reference_docname)
-		if reference and reference.meta.has_field("grand_total"):
+		if reference and reference.doctype == "Payment Request":
 			return paypal_amount(*amount_to_pay(reference))
 		if reference and reference.docstatus == 2:
 			frappe.throw(
@@ -485,6 +477,21 @@ class PayPalSettings(Document):
 		if flt(data.amount) <= 0:
 			frappe.throw(_("There is nothing to pay"), exc=NotPayable)
 		return paypal_amount(data.amount, data.currency)
+
+	def can_try_again(self, request) -> bool:
+		"""Whether a payer can pay again after an attempt that took no money (declined, or not
+		captured), while the document still asks to be paid."""
+		if request.status not in ("Failed", "Cancelled"):
+			return False
+		taken = json.loads(frappe.db.get_value("Integration Request", request.name, "output") or "{}")
+		if taken.get("status") == "COMPLETED":
+			return False
+		try:
+			self.amount_due(request)
+		except NotPayable:
+			frappe.clear_last_message()
+			return False
+		return True
 
 	def order(self, order_id: str | None) -> dict | None:
 		if not order_id:
@@ -498,6 +505,13 @@ class PayPalSettings(Document):
 
 	def checkout(self, request) -> str | Message:
 		"""Where a payer goes to pay: PayPal's page to approve an order for what is still asked."""
+		if self.can_try_again(request):
+			# nothing was taken and the document still asks to be paid: the link pays it anew
+			details = json.loads(request.data or "{}")
+			details.update(
+				reference_doctype=request.reference_doctype, reference_docname=request.reference_docname
+			)
+			request = frappe.get_doc("Integration Request", self.order_request_for(details))
 		if request.status != "Queued":
 			return self.finished(request)
 		order = self.order(request.request_id)
@@ -525,9 +539,15 @@ class PayPalSettings(Document):
 		if data.title:
 			experience["brand_name"] = cstr(data.title)[:127]
 		paypal = {"experience_context": experience}
-		# a Payment Request made without the customer's email holds the user who made it
-		if validate_email_address(cstr(data.payer_email)):
-			paypal["email_address"] = data.payer_email
+		reference = get_reference(request.reference_doctype, request.reference_docname)
+		# ERPNext names the user who made a Payment Request as its payer when it has no email
+		email = (
+			reference.get("email_to")
+			if reference and reference.doctype == "Payment Request"
+			else data.payer_email
+		)
+		if validate_email_address(cstr(email)):
+			paypal["email_address"] = email
 		order = self.api(
 			"POST",
 			"/v2/checkout/orders",
@@ -698,15 +718,15 @@ class PayPalSettings(Document):
 			)
 		request.db_set({"status": "Completed", "output": frappe.as_json(paid)}, update_modified=False)
 		redirect_to = reference.run_method("on_payment_authorized", "Completed") if reference else None
+		request.db_set("output", frappe.as_json({**paid, "redirect_to": redirect_to}), update_modified=False)
 		return self.success_location(request, redirect_to)
 
 	def finished(self, request) -> str | Message:
 		"""Where to send a payer coming back to a payment that's already settled."""
 		if request.status == "Completed":
-			# on as after paying: the document says where, and records the payment only once
-			reference = get_reference(request.reference_doctype, request.reference_docname)
-			redirect_to = reference.run_method("on_payment_authorized", "Completed") if reference else None
-			return self.success_location(request, redirect_to)
+			# recorded already: the payer is sent where they were sent then
+			paid = json.loads(frappe.db.get_value("Integration Request", request.name, "output") or "{}")
+			return self.success_location(request, paid.get("redirect_to"))
 		if request.status == "Cancelled":
 			return Message(_("Payment not taken"), _("This can no longer be paid. You haven't been charged."))
 		return "/payment-failed"
@@ -735,7 +755,11 @@ class PayPalSettings(Document):
 
 	def refund(self, reference_doctype: str, reference_docname: str, amount: float, key: str) -> str:
 		"""Refund part or all of what a document's PayPal payment took, once per key (e.g. the
-		credit note it is for). Returns PayPal's refund id."""
+		credit note it is for). For apps that refund on a staff action; returns PayPal's refund id."""
+		if frappe.session.user == "Guest":
+			raise frappe.PermissionError
+		if flt(amount) <= 0:
+			frappe.throw(_("The amount to refund must be more than zero"))
 		request = frappe.db.get_value(
 			"Integration Request",
 			{
@@ -779,7 +803,7 @@ class PayPalSettings(Document):
 		refund = self.api(
 			"POST",
 			f"/v2/payments/captures/{quote(paid.capture, safe='')}/refund",
-			payload={"amount": value, "custom_id": cstr(key)[:127]},
+			payload={"amount": value, "custom_id": refund_mark(key)},
 			headers={
 				"PayPal-Request-Id": request_key("refund", paid.capture, key, value["value"]),
 				"Prefer": "return=representation",
@@ -787,22 +811,27 @@ class PayPalSettings(Document):
 		)
 		if refund.get("status") in ("CANCELLED", "FAILED"):
 			frappe.throw(_("PayPal didn't make the refund ({0})").format(refund.get("status")))
-		create_request_log(
+		# logged against the payment it refunds, in the caller's transaction
+		frappe.get_doc(
 			{
-				"refund": refund["id"],
-				"capture": paid.capture,
-				"amount": flt(value["value"]),
-				"currency": value["currency_code"],
-				"key": key,
-			},
-			service_name="PayPal",
-			# logged against the payment it refunds: ERPNext refuses new requests for a paid Payment Request
-			reference_doctype="Integration Request",
-			reference_docname=request.name,
-			request_id=refund["id"],
-			request_description=REFUND,
-			status="Completed",
-		)
+				"doctype": "Integration Request",
+				"integration_request_service": "PayPal",
+				"request_description": REFUND,
+				"request_id": refund["id"],
+				"status": "Completed",
+				"reference_doctype": "Integration Request",
+				"reference_docname": request.name,
+				"data": frappe.as_json(
+					{
+						"refund": refund["id"],
+						"capture": paid.capture,
+						"amount": flt(value["value"]),
+						"currency": value["currency_code"],
+						"key": key,
+					}
+				),
+			}
+		).insert(ignore_permissions=True)
 		return refund["id"]
 
 	def verify_webhook(self, body: str) -> bool:
@@ -870,11 +899,11 @@ class PayPalSettings(Document):
 		"""Tell staff about money PayPal gave back from a payment that wasn't refunded here."""
 		if not request:
 			return None
-		# a refund made here is logged, and carries its own key; one made in PayPal carries the
-		# payment's (its document's name)
-		custom_id = resource.get("custom_id")
+		# a refund made here is marked as such and logged; one made in PayPal carries the payment's
+		# custom id (its document's name)
+		custom_id = cstr(resource.get("custom_id"))
 		if kind == "PAYMENT.CAPTURE.REFUNDED" and (
-			(custom_id and custom_id != request.reference_docname)
+			custom_id.startswith(REFUND_MARK)
 			or frappe.db.exists(
 				"Integration Request",
 				{"integration_request_service": "PayPal", "request_id": resource.get("id")},
@@ -1231,6 +1260,14 @@ def token_cache_key(host: str, client_id: str | None) -> str:
 	return f"paypal_access_token:{host}:{client_id}"
 
 
+REFUND_MARK = "refund:"
+
+
+def refund_mark(key: str) -> str:
+	"""The custom id of a refund made here: no document's name starts with it."""
+	return f"{REFUND_MARK}{cstr(key)}"[:127]
+
+
 def request_key(*parts) -> str:
 	"""A PayPal-Request-Id: PayPal answers a request made again with the same id as it did the first time."""
 	return hashlib.sha256(":".join((frappe.local.site, *map(cstr, parts))).encode()).hexdigest()
@@ -1311,80 +1348,6 @@ def up_link_id(resource: dict, kind: str) -> str | None:
 		if link.get("rel") == "up" and kind in href:
 			return href.rstrip("/").rsplit("/", 1)[-1]
 	return None
-
-
-def amount_to_pay(reference) -> tuple[float, str]:
-	"""What a document still asks to be paid, in its currency."""
-	if reference.docstatus != 1 or reference.get("status") in ("Paid", "Cancelled"):
-		frappe.throw(
-			_("{0} {1} has nothing left to pay").format(_(reference.doctype), reference.name), exc=NotPayable
-		)
-	amount = reference.get("grand_total")
-	if reference.meta.has_field("outstanding_amount") and reference.get("outstanding_amount") is not None:
-		amount = in_request_currency(reference, flt(reference.outstanding_amount))
-	if flt(amount) <= 0:
-		frappe.throw(
-			_("{0} {1} has nothing left to pay").format(_(reference.doctype), reference.name), exc=NotPayable
-		)
-	return flt(amount), reference.get("currency")
-
-
-def in_request_currency(reference, outstanding: float) -> float:
-	"""What a Payment Request still asks, in its own currency: ERPNext keeps it in the currency of
-	the party's account, which can differ (an order in USD for a customer whose account is in NZD)."""
-	party_currency = reference.get("party_account_currency")
-	if not party_currency or party_currency == reference.get("currency"):
-		return outstanding
-	try:
-		from erpnext.accounts.doctype.payment_request.payment_request import (
-			get_requested_amount_in_party_account_currency,
-		)
-	except ImportError:
-		return outstanding
-	requested = flt(get_requested_amount_in_party_account_currency(reference))
-	if not requested:
-		return outstanding
-	total = flt(reference.get("grand_total"))
-	return min(flt(total * outstanding / requested, 2), total)
-
-
-def tell_staff(reference, note: str) -> None:
-	"""Note something about a payment on its document (and the document that asks for it), and
-	notify Accounts Managers."""
-	documents = [reference]
-	if reference.get("reference_doctype") and reference.get("reference_name"):
-		documents.append(frappe.get_doc(reference.reference_doctype, reference.reference_name))
-	noted = False
-	for doc in documents:
-		if not frappe.db.exists(
-			"Comment", {"reference_doctype": doc.doctype, "reference_name": doc.name, "content": note}
-		):
-			doc.add_comment("Info", note)
-			noted = True
-	if not noted:
-		# told already: the gateway sent the same news again
-		return
-	staff = frappe.get_all(
-		"Has Role",
-		filters={
-			"role": "Accounts Manager",
-			"parenttype": "User",
-			"parent": ["not in", ["Administrator", "Guest"]],
-		},
-		pluck="parent",
-		distinct=True,
-	)
-	staff = [user for user in staff if frappe.db.get_value("User", user, "enabled")] or ["Administrator"]
-	enqueue_create_notification(
-		staff,
-		{
-			"type": "Alert",
-			"document_type": documents[-1].doctype,
-			"document_name": documents[-1].name,
-			"subject": note,
-			"from_user": "Administrator",
-		},
-	)
 
 
 def send_payer_to(outcome: str | Message) -> None:
