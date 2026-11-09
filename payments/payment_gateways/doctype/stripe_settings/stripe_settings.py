@@ -1,13 +1,13 @@
 # Copyright (c) 2017, Frappe Technologies and contributors
 # License: MIT. See LICENSE
 
+import json
 from datetime import UTC, datetime
 from types import MappingProxyType
 from urllib.parse import urlencode
 
 import frappe
 from frappe import _
-from frappe.desk.doctype.notification_log.notification_log import enqueue_create_notification
 from frappe.integrations.utils import create_request_log, make_get_request
 from frappe.model.document import Document
 from frappe.rate_limiter import rate_limit
@@ -23,6 +23,7 @@ from frappe.utils import (
 )
 
 from payments.utils import create_payment_gateway
+from payments.utils.payment_request import amount_to_pay, first_time, tell_staff
 
 currency_wise_minimum_charge_amount = {
 	"JPY": 50,
@@ -275,18 +276,10 @@ class StripeSettings(Document):
 		import stripe
 
 		self.data = frappe._dict(data)
-		if self.data.reference_doctype and self.data.reference_docname:
+		if self.data.reference_doctype == "Payment Request" and self.data.reference_docname:
+			# what the request asks, never what the browser sent
 			reference = frappe.get_doc(self.data.reference_doctype, self.data.reference_docname)
-			if reference.meta.has_field("grand_total"):
-				if reference.doctype != "Payment Request":
-					# only a Payment Request records what is paid for a document with a total
-					frappe.throw(
-						_("Pay {0} {1} through its Payment Request").format(
-							_(reference.doctype), reference.name
-						)
-					)
-				# what the request asks, never what the browser sent
-				self.data.amount, self.data.currency = amount_to_pay(reference)
+			self.data.amount, self.data.currency = amount_to_pay(reference)
 		stripe.api_key = self.get_password(fieldname="secret_key", raise_exception=False)
 		stripe.default_http_client = stripe.http_client.RequestsClient()
 
@@ -404,13 +397,13 @@ class StripeSettings(Document):
 				"amount": units,
 				"currency": currency.lower(),
 				"automatic_payment_methods": {"enabled": True},
-				"description": reference.get("subject")
-				or _("{0} {1}").format(_(reference_doctype), reference_docname),
+				"description": reference.get("subject") or f"{_(reference_doctype)} {reference_docname}",
 				# a request made without the customer's email holds the user who made it
 				"receipt_email": validate_email_address(reference.get("email_to") or "") or None,
 				"metadata": {
 					"reference_doctype": reference_doctype,
 					"reference_docname": reference_docname,
+					"payment_gateway": reference.get("payment_gateway") or "",
 					"site": frappe.local.site,
 				},
 			},
@@ -427,9 +420,11 @@ class StripeSettings(Document):
 		)
 		return intent
 
-	def record_payment_intent(self, intent) -> str | None:
+	def record_payment_intent(self, intent) -> frappe._dict | None:
 		"""Record a PaymentIntent Stripe reports as succeeded against the document it pays, once.
-		Returns where to send the payer next."""
+
+		Returns whether it was recorded and where to send the payer next; None for an intent this
+		site didn't make."""
 		metadata = intent.metadata or {}
 		reference_doctype, reference_docname = (
 			metadata.get("reference_doctype"),
@@ -442,64 +437,80 @@ class StripeSettings(Document):
 		locked = frappe.db.get_value(
 			"Integration Request",
 			{"integration_request_service": "Stripe", "request_id": intent.id},
-			["name", "status"],
+			["name", "status", "output"],
 			as_dict=True,
 			for_update=True,
 		)
 		if not locked:
-			return None
+			return frappe._dict(recorded=False, location=not_recorded_location())
 		request = frappe.get_doc("Integration Request", locked.name)
 		request.status = locked.status
-		reference = frappe.get_doc(reference_doctype, reference_docname)
-		if reference.docstatus == 2 and request.status != "Completed":
-			# paid in the moment the document was cancelled: kept for staff to refund or record
-			request.db_set(
-				{
-					"status": "Failed",
-					"error": _("Paid after {0} {1} was cancelled. Refund it in Stripe, or record it.").format(
-						_(reference_doctype), reference_docname
-					),
-				},
-				update_modified=False,
-			)
-			frappe.log_error(title="Stripe payment for a cancelled document", message=intent.id)
-			note = _(
-				"A card payment of {0} came in after {1} {2} was cancelled. Refund it in Stripe, or record it."
-			).format(
-				fmt_money(
-					major_units(intent.amount_received, intent.currency), currency=intent.currency.upper()
-				),
-				_(reference_doctype),
-				reference_docname,
-			)
-			tell_staff(reference, note)
-			return frappe.redirect_to_message(
-				_("Payment received after cancellation"),
-				_(
-					"Your payment came in after this was cancelled. We've told our team, and they'll refund it."
-				),
-			)
 		if request.status == "Completed":
-			# recorded already: the document only says where the payer goes next
-			return reference.run_method("on_payment_authorized", "Completed")
-		# intents are only made here, for what the document still asked, so the payment must be the
-		# intent's whole amount, no more than the document's total
-		if (
-			intent.currency != (reference.get("currency") or "").lower()
-			or intent.amount_received < intent.amount
-			or intent.amount > minor_units(reference.get("grand_total"), reference.get("currency"))
-		):
-			request.db_set(
-				{"status": "Failed", "error": _("The amount paid doesn't match")}, update_modified=False
+			# recorded already: the payer is sent where they were sent then
+			stored = json.loads(locked.output or "{}").get("redirect_to")
+			return frappe._dict(
+				recorded=True, location=stored or success_location(reference_doctype, reference_docname)
 			)
-			frappe.log_error(title="Stripe payment doesn't match its document", message=intent.id)
-			return None
+		if request.status == "Failed":
+			return frappe._dict(recorded=False, location=not_recorded_location())
+		reference = frappe.get_doc(reference_doctype, reference_docname)
+		problem = self.payment_problem(intent, reference)
+		if problem:
+			request.db_set({"status": "Failed", "error": problem}, update_modified=False)
+			frappe.log_error(title="Stripe payment not recorded", message=f"{intent.id}: {problem}")
+			paid = fmt_money(
+				major_units(intent.amount_received, intent.currency), currency=intent.currency.upper()
+			)
+			tell_staff(
+				reference,
+				_(
+					"A card payment of {0} for {1} {2} wasn't recorded. {3} Refund it in Stripe, or record it."
+				).format(paid, _(reference_doctype), reference_docname, problem),
+			)
+			return frappe._dict(recorded=False, location=not_recorded_location(reference.docstatus == 2))
 		request.db_set("status", "Completed", update_modified=False)
-		return reference.run_method("on_payment_authorized", "Completed")
+		redirect_to = reference.run_method("on_payment_authorized", "Completed")
+		request.db_set("output", json.dumps({"redirect_to": redirect_to}), update_modified=False)
+		return frappe._dict(
+			recorded=True, location=redirect_to or success_location(reference_doctype, reference_docname)
+		)
+
+	def payment_problem(self, intent, reference) -> str | None:
+		"""Why a succeeded PaymentIntent can't be recorded against its document, if it can't."""
+		if reference.doctype == "Payment Request":
+			gateway = (intent.metadata or {}).get("payment_gateway")
+			if get_gateway_controller(reference.doctype, reference.name) != self.name or (
+				gateway and gateway != reference.get("payment_gateway")
+			):
+				return _("It was taken through another payment gateway.")
+		if bool(intent.livemode) == self.test_mode:
+			return _("It was taken in Stripe's {0} mode, and the gateway is in {1} mode.").format(
+				_("live") if intent.livemode else _("test"), _("test") if self.test_mode else _("live")
+			)
+		if reference.docstatus == 2:
+			return _("{0} {1} was cancelled before it was paid.").format(_(reference.doctype), reference.name)
+		try:
+			owed, currency = amount_to_pay(reference)
+		except frappe.ValidationError:
+			frappe.clear_messages()
+			return _("{0} {1} had nothing left to pay.").format(_(reference.doctype), reference.name)
+		if intent.currency != (currency or "").lower():
+			return _("It was paid in {0}, and {1} {2} asks for {3}.").format(
+				intent.currency.upper(), _(reference.doctype), reference.name, currency
+			)
+		if intent.amount_received < intent.amount or intent.amount_received > minor_units(owed, currency):
+			return _("{0} {1} still asked for {2}.").format(
+				_(reference.doctype), reference.name, fmt_money(owed, currency=currency)
+			)
+		return None
 
 	def refund(self, reference_doctype: str, reference_docname: str, amount: float, key: str) -> str:
 		"""Refund part or all of what a document's PaymentIntent took, once per key (e.g. the credit
-		note it is for). Returns the Stripe Refund id."""
+		note it is for). For apps that refund on a staff action; returns the Stripe Refund id."""
+		if frappe.session.user == "Guest":
+			raise frappe.PermissionError
+		if flt(amount) <= 0:
+			frappe.throw(_("The amount to refund must be more than zero"))
 		request = intent_request(reference_doctype, reference_docname)
 		if not request or request.status != "Completed":
 			frappe.throw(
@@ -535,19 +546,25 @@ class StripeSettings(Document):
 			},
 			options={"idempotency_key": f"{frappe.local.site}:refund:{request.request_id}:{key}:{units}"},
 		)
-		create_request_log(
+		# logged against the payment it refunds, in the caller's transaction
+		frappe.get_doc(
 			{
-				"refund": refund.id,
-				"payment_intent": request.request_id,
-				"amount": amount,
-				"currency": currency,
-			},
-			service_name="Stripe",
-			# logged against the payment it refunds: ERPNext refuses new requests for a paid Payment Request
-			reference_doctype="Integration Request",
-			reference_docname=request.name,
-			request_id=refund.id,
-		)
+				"doctype": "Integration Request",
+				"integration_request_service": "Stripe",
+				"request_id": refund.id,
+				"status": "Completed",
+				"reference_doctype": "Integration Request",
+				"reference_docname": request.name,
+				"data": json.dumps(
+					{
+						"refund": refund.id,
+						"payment_intent": request.request_id,
+						"amount": amount,
+						"currency": currency,
+					}
+				),
+			}
+		).insert(ignore_permissions=True)
 		return refund.id
 
 
@@ -561,6 +578,13 @@ def cancel_open_intent(doc, method=None):
 			integration_request=request.name,
 			enqueue_after_commit=True,
 		)
+
+
+def cancel_paid_intents(doc, method=None):
+	"""Payment Entry on_submit: a Payment Request it pays in full can't be paid again by card."""
+	for name in {row.payment_request for row in doc.get("references") or [] if row.get("payment_request")}:
+		if frappe.db.get_value("Payment Request", name, "status") == "Paid":
+			cancel_open_intent(frappe._dict(doctype="Payment Request", name=name))
 
 
 def cancel_intent(integration_request: str) -> None:
@@ -623,45 +647,57 @@ def webhook(gateway: str | None = None):
 	elif event.type in ("charge.dispute.created", "charge.dispute.closed"):
 		record_dispute(settings.client().disputes.retrieve(event.data.object.id))
 		frappe.db.commit()  # nosemgrep
-	elif event.type == "refund.created":
+	elif event.type in ("refund.created", "refund.updated", "refund.failed"):
 		record_refund(settings.client().refunds.retrieve(event.data.object.id))
 		frappe.db.commit()  # nosemgrep
 	return {"received": True}
 
 
 def record_refund(refund) -> None:
-	"""Tell staff about a refund made in Stripe's dashboard, on the documents the payment paid. A
-	refund made here carries its key, and is recorded here."""
-	if (refund.metadata or {}).get("key") or refund.status not in ("succeeded", "pending"):
+	"""Tell staff, on the documents the payment paid, about a refund made in Stripe's dashboard once
+	it has gone through, and about any refund that failed. A refund made here carries its key and is
+	recorded here."""
+	made_here = bool((refund.metadata or {}).get("key"))
+	if not refund.payment_intent or refund.status not in ("succeeded", "failed", "canceled"):
 		return
+	if refund.status == "succeeded" and made_here:
+		return
+	paid = paid_request(refund.payment_intent)
+	if not paid or not first_time("Stripe", f"{refund.id}:{refund.status}", {"refund": refund.id}):
+		return
+	reference = frappe.get_doc(paid.reference_doctype, paid.reference_docname)
+	amount = fmt_money(major_units(refund.amount, refund.currency), currency=refund.currency.upper())
+	if refund.status == "succeeded":
+		note = _(
+			"{0} of the card payment for {1} {2} was refunded in Stripe. Record the refund in ERPNext, and don't refund it again."
+		).format(amount, _(reference.doctype), reference.name)
+	else:
+		note = _(
+			"A refund of {0} of the card payment for {1} {2} failed in Stripe: the money wasn't returned to the customer. Refund it again, or another way."
+		).format(amount, _(reference.doctype), reference.name)
+	tell_staff(reference, note)
+
+
+def paid_request(payment_intent: str | None):
+	"""The document a PaymentIntent paid, when it still exists."""
+	if not payment_intent:
+		return None
 	paid = frappe.db.get_value(
 		"Integration Request",
-		{"integration_request_service": "Stripe", "request_id": refund.payment_intent},
+		{"integration_request_service": "Stripe", "request_id": payment_intent},
 		["reference_doctype", "reference_docname"],
 		as_dict=True,
 	)
 	if not paid or not frappe.db.exists(paid.reference_doctype, paid.reference_docname):
-		return
-	reference = frappe.get_doc(paid.reference_doctype, paid.reference_docname)
-	amount = fmt_money(major_units(refund.amount, refund.currency), currency=refund.currency.upper())
-	tell_staff(
-		reference,
-		_(
-			"{0} of the card payment for {1} {2} was refunded in Stripe. Record the refund in ERPNext, and don't refund it again."
-		).format(amount, _(reference.doctype), reference.name),
-	)
+		return None
+	return paid
 
 
 def record_dispute(dispute) -> None:
 	"""Tell staff about a payment the customer disputed with their bank (a chargeback), on the
 	documents it paid. Disputes are answered in Stripe; what was lost is recorded by staff."""
-	paid = frappe.db.get_value(
-		"Integration Request",
-		{"integration_request_service": "Stripe", "request_id": dispute.payment_intent},
-		["reference_doctype", "reference_docname"],
-		as_dict=True,
-	)
-	if not paid or not frappe.db.exists(paid.reference_doctype, paid.reference_docname):
+	paid = paid_request(dispute.payment_intent)
+	if not paid or not first_time("Stripe", f"{dispute.id}:{dispute.status}", {"dispute": dispute.id}):
 		return
 	amount = fmt_money(major_units(dispute.amount, dispute.currency), currency=dispute.currency.upper())
 	reason = (dispute.reason or "general").replace("_", " ")
@@ -687,78 +723,30 @@ def record_dispute(dispute) -> None:
 	tell_staff(frappe.get_doc(paid.reference_doctype, paid.reference_docname), note)
 
 
-def amount_to_pay(reference) -> tuple[float, str]:
-	"""What a document still asks to be paid, in its currency."""
-	if reference.docstatus != 1 or reference.get("status") in ("Paid", "Cancelled"):
-		frappe.throw(_("{0} {1} has nothing left to pay").format(_(reference.doctype), reference.name))
-	amount = reference.get("grand_total")
-	if reference.meta.has_field("outstanding_amount") and reference.get("outstanding_amount") is not None:
-		amount = in_request_currency(reference, flt(reference.outstanding_amount))
-	if flt(amount) <= 0:
-		frappe.throw(_("{0} {1} has nothing left to pay").format(_(reference.doctype), reference.name))
-	return flt(amount), reference.get("currency")
+def success_location(reference_doctype: str, reference_docname: str) -> str:
+	return f"/payment-success?{urlencode({'doctype': reference_doctype, 'docname': reference_docname})}"
 
 
-def in_request_currency(reference, outstanding: float) -> float:
-	"""What a Payment Request still asks, in its own currency: ERPNext keeps it in the currency of
-	the party's account, which can differ (an order in USD for a customer whose account is in NZD)."""
-	party_currency = reference.get("party_account_currency")
-	if not party_currency or party_currency == reference.get("currency"):
-		return outstanding
-	try:
-		from erpnext.accounts.doctype.payment_request.payment_request import (
-			get_requested_amount_in_party_account_currency,
+def not_recorded_location(cancelled: bool = False) -> str:
+	"""Where a payer goes when their payment came in but couldn't be recorded."""
+	if cancelled:
+		return frappe.redirect_to_message(
+			_("Payment received after cancellation"),
+			_("Your payment came in after this was cancelled. We've told our team, and they'll refund it."),
 		)
-	except ImportError:
-		return outstanding
-	requested = flt(get_requested_amount_in_party_account_currency(reference))
-	if not requested:
-		return outstanding
-	total = flt(reference.get("grand_total"))
-	return min(flt(total * outstanding / requested, 2), total)
-
-
-def tell_staff(reference, note: str) -> None:
-	"""Note something about a payment on its document (and the document that asks for it), and
-	notify Accounts Managers."""
-	documents = [reference]
-	if reference.get("reference_doctype") and reference.get("reference_name"):
-		documents.append(frappe.get_doc(reference.reference_doctype, reference.reference_name))
-	noted = False
-	for doc in documents:
-		if not frappe.db.exists(
-			"Comment", {"reference_doctype": doc.doctype, "reference_name": doc.name, "content": note}
-		):
-			doc.add_comment("Info", note)
-			noted = True
-	if not noted:
-		# told already: the gateway sent the same news again
-		return
-	staff = frappe.get_all(
-		"Has Role",
-		filters={
-			"role": "Accounts Manager",
-			"parenttype": "User",
-			"parent": ["not in", ["Administrator", "Guest"]],
-		},
-		pluck="parent",
-		distinct=True,
-	)
-	staff = [user for user in staff if frappe.db.get_value("User", user, "enabled")] or ["Administrator"]
-	enqueue_create_notification(
-		staff,
-		{
-			"type": "Alert",
-			"document_type": documents[-1].doctype,
-			"document_name": documents[-1].name,
-			"subject": note,
-			"from_user": "Administrator",
-		},
+	return frappe.redirect_to_message(
+		_("Payment received"),
+		_(
+			"Your payment came in, but it couldn't be matched to what you owe. We've told our team, and they'll sort it out."
+		),
 	)
 
 
 def get_gateway_controller(doctype, docname, payment_gateway=None):
+	"""The Stripe Settings a document is paid through. A Payment Request is always paid through its
+	own gateway, whatever gateway its payer names."""
+	if doctype == "Payment Request" or not payment_gateway:
+		payment_gateway = frappe.db.get_value(doctype, docname, "payment_gateway")
 	if not payment_gateway:
-		reference_doc = frappe.get_doc(doctype, docname)
-		payment_gateway = reference_doc.payment_gateway
+		return None
 	return frappe.db.get_value("Payment Gateway", payment_gateway, "gateway_controller")

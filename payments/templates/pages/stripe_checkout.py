@@ -5,12 +5,13 @@ import json
 import frappe
 from frappe import _
 from frappe.rate_limiter import rate_limit
-from frappe.utils import cint, fmt_money
+from frappe.utils import fmt_money
 
 from payments.payment_gateways.doctype.stripe_settings.stripe_settings import (
 	get_gateway_controller,
 	key_mode,
 	major_units,
+	not_recorded_location,
 )
 
 no_cache = 1
@@ -38,6 +39,10 @@ def get_context(context):
 		gateway_controller = get_gateway_controller(
 			context.reference_doctype, context.reference_docname, context.payment_gateway
 		)
+		if not gateway_controller:
+			redirect_to_message(
+				_("Payment not available"), _("This payment link isn't valid. Please ask for a new one.")
+			)
 		context.publishable_key = get_api_key(context.reference_docname, gateway_controller)
 		context.test_mode = key_mode(context.publishable_key) == "test"
 		context.image = get_header_image(context.reference_docname, gateway_controller)
@@ -51,48 +56,35 @@ def get_context(context):
 			recurrence = frappe.db.get_value("Payment Plan", payment_plan, "recurrence")
 
 			context["amount"] = context["amount"] + " " + _(recurrence)
-		elif context.reference_doctype != "Payment Request" and frappe.get_meta(
-			context.reference_doctype
-		).has_field("grand_total"):
-			# a document with a total is paid through its Payment Request, which records the payment
-			frappe.redirect_to_message(
-				_("Payment not available"), _("This payment link isn't valid. Please ask for a new one.")
-			)
-			frappe.local.flags.redirect_location = frappe.local.response.location
-			raise frappe.Redirect(302)
 		elif context.reference_doctype == "Payment Request":
 			# a one-off payment: a PaymentIntent for what the request asks, so the bank can
 			# authenticate the payer (3-D Secure) and wallets work. Only a Payment Request, which is
 			# made to be paid by whoever has its link, is looked up from the link.
 			if frappe.db.get_value(context.reference_doctype, context.reference_docname, "docstatus") == 2:
-				frappe.redirect_to_message(
+				redirect_to_message(
 					_("Payment not available"), _("This payment was cancelled, so it can't be paid.")
 				)
-				frappe.local.flags.redirect_location = frappe.local.response.location
-				raise frappe.Redirect(302)
 			settings = frappe.get_doc("Stripe Settings", gateway_controller)
 			try:
-				intent = settings.payment_intent(context.reference_doctype, context.reference_docname)
-			except frappe.ValidationError:
+				intent = open_payment_intent(settings, context.reference_doctype, context.reference_docname)
+			except frappe.ValidationError as e:
 				frappe.clear_messages()
-				frappe.redirect_to_message(_("Payment not available"), _("There's nothing left to pay here."))
-				frappe.local.flags.redirect_location = frappe.local.response.location
-				raise frappe.Redirect(302)
+				redirect_to_message(
+					_("Payment not available"), str(e) or _("There's nothing left to pay here.")
+				)
 			if intent.status == "succeeded":
 				# paid already (the payer came back to this page): recorded once, then on as after paying
 				frappe.local.flags.commit = True
+				outcome = settings.record_payment_intent(intent)
 				frappe.local.flags.redirect_location = (
-					settings.record_payment_intent(intent)
-					or f"/payment-success?doctype={context.reference_doctype}&docname={context.reference_docname}"
+					outcome.location if outcome else not_recorded_location()
 				)
 				raise frappe.Redirect(302)
 			if intent.status == "processing":
-				frappe.redirect_to_message(
+				redirect_to_message(
 					_("Payment processing"),
 					_("Your payment is processing. You'll get an email once it's confirmed."),
 				)
-				frappe.local.flags.redirect_location = frappe.local.response.location
-				raise frappe.Redirect(302)
 			context.client_secret = intent.client_secret
 			# what the intent asks (the request's outstanding amount), with the code, as many
 			# currencies share a symbol
@@ -111,11 +103,19 @@ def get_context(context):
 
 
 def get_api_key(doc, gateway_controller):
-	publishable_key = frappe.db.get_value("Stripe Settings", gateway_controller, "publishable_key")
-	if cint(frappe.form_dict.get("use_sandbox")):
-		publishable_key = frappe.conf.sandbox_publishable_key
+	return frappe.db.get_value("Stripe Settings", gateway_controller, "publishable_key")
 
-	return publishable_key
+
+def redirect_to_message(title: str, message: str):
+	frappe.redirect_to_message(title, message)
+	frappe.local.flags.redirect_location = frappe.local.response.location
+	raise frappe.Redirect(302)
+
+
+# the pay page is open to guests and makes a PaymentIntent
+@rate_limit(limit=30, seconds=60 * 10)
+def open_payment_intent(settings, reference_doctype: str, reference_docname: str):
+	return settings.payment_intent(reference_doctype, reference_docname)
 
 
 def get_header_image(doc, gateway_controller):
@@ -163,6 +163,8 @@ def confirm_payment(
 	"""After Stripe confirms a payment in the browser: check the PaymentIntent with Stripe and record
 	the payment against its document."""
 	gateway_controller = get_gateway_controller(reference_doctype, reference_docname, payment_gateway)
+	if not gateway_controller:
+		raise frappe.PermissionError
 	settings = frappe.get_doc("Stripe Settings", gateway_controller)
 	intent = settings.client().payment_intents.retrieve(payment_intent)
 	metadata = intent.metadata or {}
@@ -172,13 +174,14 @@ def confirm_payment(
 	):
 		raise frappe.PermissionError
 	if intent.status == "succeeded":
-		redirect_to = settings.record_payment_intent(intent)
+		outcome = settings.record_payment_intent(intent)
 		# reachable as a guest, and the payment must be recorded
 		frappe.db.commit()  # nosemgrep
+		if outcome and outcome.recorded:
+			return {"status": "Completed", "redirect_to": outcome.location}
 		return {
-			"status": "Completed",
-			"redirect_to": redirect_to
-			or f"payment-success?doctype={reference_doctype}&docname={reference_docname}",
+			"status": "Not Recorded",
+			"redirect_to": outcome.location if outcome else not_recorded_location(),
 		}
 	if intent.status == "processing":
 		return {

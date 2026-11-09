@@ -47,35 +47,33 @@ class TestStripeSettings(IntegrationTestCase):
 	def test_what_is_owed_is_in_the_requests_currency(self):
 		from unittest.mock import MagicMock, patch
 
-		from payments.payment_gateways.doctype.stripe_settings import stripe_settings as gateway
+		from payments.utils import payment_request
 
-		# a USD order for a customer whose account is in NZD: ERPNext keeps what is owed in NZD
+		# a USD request for a customer whose account is in INR: ERPNext keeps what is owed in INR
 		values = {
 			"status": "Requested",
 			"currency": "USD",
-			"party_account_currency": "NZD",
+			"party_account_currency": "INR",
 			"grand_total": 60.12,
-			"outstanding_amount": 107.70,
+			"outstanding_amount": 5011.00,
 		}
-		request = MagicMock(docstatus=1, outstanding_amount=107.70)
+		request = MagicMock(docstatus=1, outstanding_amount=5011.00)
 		request.get.side_effect = lambda field, default=None: values.get(field, default)
 		request.meta.has_field.return_value = True
-		with patch(
-			"erpnext.accounts.doctype.payment_request.payment_request.get_requested_amount_in_party_account_currency",
-			return_value=107.70,
-		):
-			self.assertEqual(gateway.amount_to_pay(request), (60.12, "USD"))
+		request.precision.return_value = 2
+		with patch.object(payment_request, "requested_in_party_currency", return_value=5011.00):
+			self.assertEqual(payment_request.amount_to_pay(request), (60.12, "USD"))
 			# half paid
-			values["outstanding_amount"] = request.outstanding_amount = 53.85
-			self.assertEqual(gateway.amount_to_pay(request), (30.06, "USD"))
+			values["outstanding_amount"] = request.outstanding_amount = 2505.50
+			self.assertEqual(payment_request.amount_to_pay(request), (30.06, "USD"))
 		values.update(party_account_currency="USD", outstanding_amount=60.12)
 		request.outstanding_amount = 60.12
-		self.assertEqual(gateway.amount_to_pay(request), (60.12, "USD"))
+		self.assertEqual(payment_request.amount_to_pay(request), (60.12, "USD"))
 
 	def test_amounts_are_in_the_currencys_smallest_unit(self):
 		from payments.payment_gateways.doctype.stripe_settings.stripe_settings import minor_units
 
-		self.assertEqual(minor_units(293.29, "NZD"), 29329)
+		self.assertEqual(minor_units(293.29, "USD"), 29329)
 		self.assertEqual(minor_units(1000, "JPY"), 1000)
 		self.assertEqual(minor_units(12.35, "KWD"), 12350)
 
@@ -113,18 +111,21 @@ class TestStripeSettings(IntegrationTestCase):
 		with (
 			patch.object(stripe_settings.StripeSettings, "client", return_value=client),
 			patch.object(stripe_settings, "intent_request", return_value=paid),
-			patch("frappe.db.get_value", return_value="NZD"),
-			patch.object(stripe_settings, "create_request_log") as log,
+			patch("frappe.db.get_value", return_value="USD"),
+			patch("frappe.get_doc") as log,
 		):
 			self.assertEqual(settings.refund("Payment Request", "PR-1", 12.5, "CN-1"), "re_test_1")
 		params = client.refunds.create.call_args.kwargs["params"]
 		self.assertEqual((params["payment_intent"], params["amount"]), ("pi_test_1", 1250))
 		self.assertIn("CN-1", client.refunds.create.call_args.kwargs["options"]["idempotency_key"])
-		self.assertEqual(log.call_args.kwargs["request_id"], "re_test_1")
+		logged = log.call_args.args[0]
+		self.assertEqual(logged["request_id"], "re_test_1")
 		self.assertEqual(
-			(log.call_args.kwargs["reference_doctype"], log.call_args.kwargs["reference_docname"]),
-			("Integration Request", "IR-1"),
+			(logged["reference_doctype"], logged["reference_docname"]), ("Integration Request", "IR-1")
 		)
+		log.return_value.insert.assert_called_once()
+		with self.assertRaises(frappe.ValidationError):
+			settings.refund("Payment Request", "PR-1", 0, "CN-0")
 		with (
 			patch.object(stripe_settings, "intent_request", return_value=None),
 			self.assertRaises(frappe.ValidationError),
@@ -139,7 +140,7 @@ class TestStripeSettings(IntegrationTestCase):
 		with (
 			patch.object(stripe_settings.StripeSettings, "client", return_value=client),
 			patch.object(stripe_settings, "intent_request", return_value=paid),
-			patch("frappe.db.get_value", return_value="NZD"),
+			patch("frappe.db.get_value", return_value="USD"),
 		):
 			self.assertEqual(settings.refund("Payment Request", "PR-1", 12.5, "CN-1"), "re_test_1")
 		client.refunds.create.assert_not_called()
@@ -151,7 +152,7 @@ class TestStripeSettings(IntegrationTestCase):
 		with (
 			patch.object(stripe_settings.StripeSettings, "client", return_value=client),
 			patch.object(stripe_settings, "intent_request", return_value=paid),
-			patch("frappe.db.get_value", return_value="NZD"),
+			patch("frappe.db.get_value", return_value="USD"),
 			self.assertRaises(frappe.ValidationError) as refused,
 		):
 			settings.refund("Payment Request", "PR-1", 12.5, "CN-3")
@@ -169,21 +170,40 @@ class TestStripeSettings(IntegrationTestCase):
 		order.name = "PR-1"
 		paid = frappe._dict(reference_doctype="Payment Request", reference_docname="PR-1")
 		refund = frappe._dict(
-			payment_intent="pi_1", amount=1000, currency="nzd", status="succeeded", metadata={}
+			id="re_1", payment_intent="pi_1", amount=1000, currency="usd", status="succeeded", metadata={}
 		)
 		with (
-			patch("frappe.db.get_value", return_value=paid),
-			patch("frappe.db.exists", return_value=True),
+			patch.object(stripe_settings, "paid_request", return_value=paid),
+			patch.object(stripe_settings, "first_time", return_value=True) as first_time,
 			patch("frappe.get_doc", return_value=order),
 			patch.object(stripe_settings, "tell_staff") as tell_staff,
 		):
 			stripe_settings.record_refund(refund)
 			self.assertIn("10.00", tell_staff.call_args.args[1])
 			self.assertIn("refunded in Stripe", tell_staff.call_args.args[1])
-			# a refund made here carries its key
+			self.assertEqual(first_time.call_args.args[1], "re_1:succeeded")
+			# a refund made here carries its key; one still pending is told once it is settled
 			tell_staff.reset_mock()
 			stripe_settings.record_refund(frappe._dict(refund, metadata={"key": "CN-1"}))
+			stripe_settings.record_refund(frappe._dict(refund, status="pending"))
 			tell_staff.assert_not_called()
+			# a refund that fails is told, wherever it was made
+			stripe_settings.record_refund(frappe._dict(refund, status="failed", metadata={"key": "CN-1"}))
+			self.assertIn("failed in Stripe", tell_staff.call_args.args[1])
+			# two refunds of the same amount are two refunds
+			tell_staff.reset_mock()
+			stripe_settings.record_refund(frappe._dict(refund, id="re_2"))
+			tell_staff.assert_called_once()
+		with (
+			patch.object(stripe_settings, "paid_request", return_value=paid),
+			patch.object(stripe_settings, "first_time", return_value=False),
+			patch.object(stripe_settings, "tell_staff") as tell_staff,
+		):
+			# the same news sent again
+			stripe_settings.record_refund(refund)
+		tell_staff.assert_not_called()
+		# a refund of a payment taken without a PaymentIntent belongs to no document here
+		self.assertIsNone(stripe_settings.paid_request(None))
 
 	def test_pay_page_sends_a_payer_who_has_paid_on(self):
 		from unittest.mock import MagicMock, patch
@@ -194,9 +214,9 @@ class TestStripeSettings(IntegrationTestCase):
 
 		settings = MagicMock()
 		settings.payment_intent.return_value = frappe._dict(status="succeeded", client_secret="cs_x")
-		settings.record_payment_intent.return_value = "/order/SO-1"
+		settings.record_payment_intent.return_value = frappe._dict(recorded=True, location="/order/SO-1")
 		form = dict.fromkeys(stripe_checkout.expected_keys, "x")
-		form.update(amount=10, currency="NZD", reference_doctype="Payment Request")
+		form.update(amount=10, currency="USD", reference_doctype="Payment Request")
 		get_doc = frappe.get_doc
 		with (
 			patch.object(frappe.local, "form_dict", frappe._dict(form)),
@@ -226,7 +246,7 @@ class TestStripeSettings(IntegrationTestCase):
 
 		settings = MagicMock()
 		form = dict.fromkeys(stripe_checkout.expected_keys, "x")
-		form.update(amount=10, currency="NZD", reference_doctype="Payment Request")
+		form.update(amount=10, currency="USD", reference_doctype="Payment Request")
 		get_doc, get_value = frappe.get_doc, frappe.db.get_value
 		with (
 			patch.object(frappe.local, "form_dict", frappe._dict(form)),
@@ -299,43 +319,191 @@ class TestStripeSettings(IntegrationTestCase):
 				stripe_settings.cancel_intent("IR-1")
 			self.assertEqual(client.payment_intents.cancel.called, cancelled)
 
-	def test_a_payment_for_a_cancelled_document_is_kept_for_staff(self):
+	def record(self, intent=None, reference=None, status="Queued", output=None, controller="_Test Stripe"):
+		"""Record a PaymentIntent for PR-1 with the Integration Request, document and gateway given."""
 		from unittest.mock import MagicMock, patch
 
 		import frappe
 
 		from payments.payment_gateways.doctype.stripe_settings import stripe_settings
 
-		request = MagicMock(status="Queued")
-		reference = MagicMock(docstatus=2)
+		request = MagicMock(status=status)
+		if reference is None:
+			reference = MagicMock(docstatus=1, doctype="Payment Request")
+			reference.name = "PR-1"
+			reference.get.side_effect = {"payment_gateway": "Stripe-_Test Stripe"}.get
+			reference.run_method.return_value = "/order/SO-1"
 		intent = frappe._dict(
-			id="pi_test_1",
-			status="succeeded",
-			amount_received=1250,
-			currency="nzd",
-			metadata={
-				"reference_doctype": "Payment Request",
-				"reference_docname": "PR-1",
-				"site": frappe.local.site,
-			},
+			{
+				"id": "pi_test_1",
+				"status": "succeeded",
+				"amount": 1250,
+				"amount_received": 1250,
+				"currency": "usd",
+				"livemode": False,
+				"metadata": {
+					"reference_doctype": "Payment Request",
+					"reference_docname": "PR-1",
+					"payment_gateway": "Stripe-_Test Stripe",
+					"site": frappe.local.site,
+				},
+			}
+			| (intent or {})
 		)
 		settings = frappe.new_doc("Stripe Settings")
+		settings.name, settings.publishable_key = "_Test Stripe", "pk_test_x"
 		with (
-			patch("frappe.db.get_value", return_value=frappe._dict(name="IR-1", status="Queued")),
+			patch(
+				"frappe.db.get_value",
+				return_value=frappe._dict(name="IR-1", status=status, output=output),
+			),
 			patch(
 				"frappe.get_doc",
 				side_effect=lambda doctype, name: request if doctype == "Integration Request" else reference,
 			),
-			patch("frappe.log_error") as log_error,
+			patch.object(stripe_settings, "get_gateway_controller", return_value=controller),
+			patch.object(stripe_settings, "amount_to_pay", return_value=(12.5, "USD")),
+			patch("frappe.log_error"),
 			patch.object(stripe_settings, "tell_staff") as tell_staff,
 			patch("frappe.redirect_to_message", return_value="/message?id=1"),
 		):
-			# the payer is told, staff are told, and nothing is recorded against the document
-			self.assertEqual(settings.record_payment_intent(intent), "/message?id=1")
-		self.assertEqual(request.db_set.call_args.args[0]["status"], "Failed")
-		reference.run_method.assert_not_called()
-		log_error.assert_called_once()
-		self.assertIn("12.50", tell_staff.call_args.args[1])
+			outcome = settings.record_payment_intent(intent)
+		return frappe._dict(outcome=outcome, request=request, reference=reference, tell_staff=tell_staff)
+
+	def test_a_payment_is_recorded_once(self):
+		import json
+
+		first = self.record()
+		self.assertEqual((first.outcome.recorded, first.outcome.location), (True, "/order/SO-1"))
+		first.reference.run_method.assert_called_once_with("on_payment_authorized", "Completed")
+		self.assertEqual(first.request.db_set.call_args_list[0].args, ("status", "Completed"))
+		stored = first.request.db_set.call_args_list[1].args
+		self.assertEqual((stored[0], json.loads(stored[1])), ("output", {"redirect_to": "/order/SO-1"}))
+		# the payer comes back, or Stripe sends the event again: sent where they were sent, nothing more
+		again = self.record(status="Completed", output=json.dumps({"redirect_to": "/order/SO-1"}))
+		self.assertEqual((again.outcome.recorded, again.outcome.location), (True, "/order/SO-1"))
+		again.reference.run_method.assert_not_called()
+
+	def test_a_payment_that_cant_be_recorded_is_kept_for_staff(self):
+		from unittest.mock import MagicMock
+
+		cancelled = MagicMock(docstatus=2, doctype="Payment Request")
+		cancelled.name = "PR-1"
+		cancelled.get.side_effect = {"payment_gateway": "Stripe-_Test Stripe"}.get
+		for case in (
+			{"controller": "_Test Stripe Other"},
+			{
+				"intent": {
+					"metadata": {
+						"reference_doctype": "Payment Request",
+						"reference_docname": "PR-1",
+						"payment_gateway": "Stripe-Other",
+						"site": frappe.local.site,
+					}
+				}
+			},
+			{"intent": {"livemode": True}},
+			{"intent": {"amount": 2000, "amount_received": 2000}},
+			{"intent": {"currency": "eur"}},
+			{"reference": cancelled},
+		):
+			result = self.record(**case)
+			self.assertFalse(result.outcome.recorded, case)
+			self.assertEqual(result.outcome.location, "/message?id=1")
+			self.assertEqual(result.request.db_set.call_args.args[0]["status"], "Failed")
+			result.reference.run_method.assert_not_called()
+			self.assertIn("12.50", result.tell_staff.call_args.args[1])
+		# one already refused isn't told again
+		again = self.record(status="Failed")
+		self.assertFalse(again.outcome.recorded)
+		again.tell_staff.assert_not_called()
+
+	def test_nothing_left_to_pay_isnt_paid_again(self):
+		from unittest.mock import patch
+
+		import frappe
+
+		from payments.payment_gateways.doctype.stripe_settings import stripe_settings
+
+		with patch.object(stripe_settings, "amount_to_pay", side_effect=frappe.ValidationError("paid")):
+			settings = frappe.new_doc("Stripe Settings")
+			settings.name, settings.publishable_key = "_Test Stripe", "pk_test_x"
+			reference = frappe._dict(doctype="Sales Invoice", name="SINV-1", docstatus=1)
+			intent = frappe._dict(
+				livemode=False, metadata={}, currency="usd", amount=1250, amount_received=1250
+			)
+			self.assertIn("nothing left to pay", settings.payment_problem(intent, reference))
+
+	def test_a_payment_request_is_paid_through_its_own_gateway(self):
+		from unittest.mock import patch
+
+		from payments.payment_gateways.doctype.stripe_settings import stripe_settings
+
+		def get_value(doctype, name, field):
+			return {
+				("Payment Request", "PR-1", "payment_gateway"): "Stripe-Live",
+				("Payment Gateway", "Stripe-Live", "gateway_controller"): "Live",
+				("Payment Gateway", "Stripe-Test", "gateway_controller"): "Test",
+			}.get((doctype, name, field))
+
+		with patch("frappe.db.get_value", side_effect=get_value):
+			# the payer can't choose another gateway, such as one in test mode
+			self.assertEqual(
+				stripe_settings.get_gateway_controller("Payment Request", "PR-1", "Stripe-Test"), "Live"
+			)
+			self.assertEqual(stripe_settings.get_gateway_controller("Payment Request", "PR-1"), "Live")
+			self.assertEqual(
+				stripe_settings.get_gateway_controller("Web Form", "WF-1", "Stripe-Test"), "Test"
+			)
+
+	def test_a_payment_that_wasnt_recorded_isnt_shown_as_a_success(self):
+		from unittest.mock import MagicMock, patch
+
+		import frappe
+
+		from payments.templates.pages import stripe_checkout
+
+		settings = MagicMock()
+		settings.client.return_value.payment_intents.retrieve.return_value = frappe._dict(
+			status="succeeded", metadata={"reference_doctype": "Payment Request", "reference_docname": "PR-1"}
+		)
+		settings.record_payment_intent.return_value = frappe._dict(recorded=False, location="/message?id=1")
+		with (
+			patch.object(stripe_checkout, "get_gateway_controller", return_value="_Test Stripe"),
+			patch("frappe.get_doc", return_value=settings),
+			patch("frappe.db.commit"),
+		):
+			result = stripe_checkout.confirm_payment("pi_1", "Payment Request", "PR-1", "Stripe-Other")
+		self.assertEqual(result, {"status": "Not Recorded", "redirect_to": "/message?id=1"})
+
+	def test_a_paid_request_cancels_its_open_intent(self):
+		from unittest.mock import patch
+
+		import frappe
+
+		from payments.payment_gateways.doctype.stripe_settings import stripe_settings
+
+		entry = frappe._dict(
+			references=[frappe._dict(payment_request="PR-1"), frappe._dict(payment_request=None)]
+		)
+		for status, cancelled in (("Paid", True), ("Partially Paid", False)):
+			with (
+				patch("frappe.db.get_value", return_value=status),
+				patch.object(stripe_settings, "cancel_open_intent") as cancel,
+			):
+				stripe_settings.cancel_paid_intents(entry)
+			self.assertEqual(cancel.called, cancelled)
+
+	def test_refunds_are_a_staff_action(self):
+		import frappe
+
+		settings = frappe.new_doc("Stripe Settings")
+		frappe.set_user("Guest")
+		try:
+			with self.assertRaises(frappe.PermissionError):
+				settings.refund("Payment Request", "PR-1", 5, "CN-1")
+		finally:
+			frappe.set_user("Administrator")
 
 	def test_a_request_without_the_payers_email_still_opens(self):
 		from unittest.mock import MagicMock, patch
@@ -365,6 +533,7 @@ class TestStripeSettings(IntegrationTestCase):
 		import frappe
 
 		from payments.payment_gateways.doctype.stripe_settings import stripe_settings
+		from payments.utils import payment_request
 
 		order = MagicMock(doctype="Sales Order")
 		order.name = "SO-1"
@@ -373,9 +542,10 @@ class TestStripeSettings(IntegrationTestCase):
 		request.get.side_effect = {"reference_doctype": "Sales Order", "reference_name": "SO-1"}.get
 		paid = frappe._dict(reference_doctype="Payment Request", reference_docname="PR-1")
 		dispute = frappe._dict(
+			id="dp_1",
 			payment_intent="pi_1",
 			amount=3800,
-			currency="nzd",
+			currency="usd",
 			reason="fraudulent",
 			status="needs_response",
 			evidence_details={"due_by": 1795000000},
@@ -399,7 +569,8 @@ class TestStripeSettings(IntegrationTestCase):
 			patch("frappe.db.exists", side_effect=exists),
 			patch("frappe.get_doc", side_effect=lambda *a, **k: docs.get(a[0]) or real_get_doc(*a, **k)),
 			patch.object(stripe_settings.frappe, "get_all", return_value=["accounts@example.com"]),
-			patch.object(stripe_settings, "enqueue_create_notification") as notify,
+			patch.object(stripe_settings, "first_time", return_value=True),
+			patch.object(payment_request, "enqueue_create_notification") as notify,
 		):
 			stripe_settings.record_dispute(dispute)
 			note = order.add_comment.call_args.args[1]
@@ -418,11 +589,16 @@ class TestStripeSettings(IntegrationTestCase):
 			patch("frappe.db.get_value", side_effect=get_value),
 			patch("frappe.db.exists", return_value=True),
 			patch("frappe.get_doc", side_effect=lambda *a, **k: docs.get(a[0]) or real_get_doc(*a, **k)),
-			patch.object(stripe_settings, "enqueue_create_notification") as notify_again,
+			patch.object(stripe_settings, "first_time", return_value=False),
+			patch.object(payment_request, "enqueue_create_notification") as notify_again,
 		):
 			stripe_settings.record_dispute(frappe._dict(dispute, status="lost"))
 		notify_again.assert_not_called()
 		self.assertTrue(notified)
+		# a dispute over a payment taken without a PaymentIntent belongs to no document here
+		with patch.object(stripe_settings, "tell_staff") as tell_staff:
+			stripe_settings.record_dispute(frappe._dict(dispute, payment_intent=None))
+		tell_staff.assert_not_called()
 
 	def test_a_charge_is_for_what_the_document_still_asks(self):
 		from unittest.mock import MagicMock, patch
@@ -437,10 +613,10 @@ class TestStripeSettings(IntegrationTestCase):
 			"status": "Partially Paid",
 			"grand_total": 500,
 			"outstanding_amount": 300,
-			"currency": "NZD",
+			"currency": "USD",
 		}.get(field, default)
 		request.meta.has_field.return_value = True
-		self.assertEqual(stripe_settings.amount_to_pay(request), (300, "NZD"))
+		self.assertEqual(stripe_settings.amount_to_pay(request), (300, "USD"))
 
 		paid = MagicMock(docstatus=1)
 		paid.get.side_effect = lambda field, default=None: {"status": "Paid"}.get(field, default)
@@ -458,21 +634,24 @@ class TestStripeSettings(IntegrationTestCase):
 			data = settings.create_request(
 				{
 					"amount": 0.5,
-					"currency": "nzd",
+					"currency": "usd",
 					"reference_doctype": "Payment Request",
 					"reference_docname": "PR-9",
 				}
 			)
-		self.assertEqual((data.amount, data.currency), (300, "NZD"))
+		self.assertEqual((data.amount, data.currency), (300, "USD"))
 
-		# any other document with a total is paid through its Payment Request, which records it
-		order = MagicMock(doctype="Sales Order")
-		with patch("frappe.get_doc", return_value=order), self.assertRaises(frappe.ValidationError):
-			settings.create_request(
+		# another document is charged as before, for what its payment page asks
+		with (
+			patch.object(stripe_settings, "create_request_log"),
+			patch.object(stripe_settings.StripeSettings, "create_charge_on_stripe", lambda s: s.data),
+		):
+			data = settings.create_request(
 				{
 					"amount": 0.5,
-					"currency": "nzd",
-					"reference_doctype": "Sales Order",
-					"reference_docname": "SO-1",
+					"currency": "usd",
+					"reference_doctype": "Web Form",
+					"reference_docname": "WF-1",
 				}
 			)
+		self.assertEqual((data.amount, data.currency), (0.5, "usd"))

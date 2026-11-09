@@ -27,6 +27,9 @@ function recordPayment(paymentIntent) {
 			$("#submit").hide();
 			showOutcome({{ _("Your payment has been successfully registered.") | json }});
 			window.location.href = result.redirect_to;
+		} else if (result.redirect_to) {
+			$("#submit").hide();
+			window.location.href = result.redirect_to;
 		} else {
 			showOutcome(result.message, result.status !== "Processing");
 			$("#submit").prop("disabled", false);
