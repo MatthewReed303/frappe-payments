@@ -99,6 +99,7 @@ extend_doctype_class = {
 	# invoice payment links (payments.utils.invoice_links)
 	"Sales Invoice": "payments.utils.invoice_links.InvoiceLinks",
 	"Customer": "payments.utils.invoice_links.CustomerLinks",
+	"Dunning": "payments.utils.invoice_links.DunningLinks",
 }
 after_migrate = "payments.utils.invoice_links.make_fields"
 pdf_body_html = "payments.utils.invoice_links.pdf_body_html"

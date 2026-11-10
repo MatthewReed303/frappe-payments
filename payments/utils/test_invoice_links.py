@@ -164,3 +164,23 @@ class TestInvoiceLinks(IntegrationTestCase):
 			restrict_globals=True,
 		)
 		self.assertIn("/pay_invoice?customer=", rendered)
+
+	def test_a_dunning_letter_links_to_the_overdue_invoices(self):
+		from erpnext.accounts.doctype.dunning.test_dunning import create_dunning
+
+		dunning = create_dunning(overdue_days=20)
+		dunning.submit()
+		self.assertIn("/pay_invoice?customer=", dunning.payment_link)
+		communication = frappe.get_doc(
+			{
+				"doctype": "Communication",
+				"communication_type": "Communication",
+				"sent_or_received": "Sent",
+				"subject": "Overdue",
+				"content": "<p>Your account is overdue.</p>",
+				"reference_doctype": "Dunning",
+				"reference_name": dunning.name,
+			}
+		).insert(ignore_permissions=True)
+		self.assertIn("Pay your overdue invoices online", communication.content)
+		self.assertIn("invoice-payment-link", frappe.get_print("Dunning", dunning.name, "Standard"))

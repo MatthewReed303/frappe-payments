@@ -24,6 +24,8 @@ CHOSEN = "Chosen Customers"
 OFF = "Off"
 PAGE = "/pay_invoice"
 PRINT_HOOK = "payments.utils.invoice_links.pdf_body_html"
+# documents a customer is sent that carry a payment link
+LINKED = ("Sales Invoice", "Dunning")
 
 
 def erpnext_installed() -> bool:
@@ -135,6 +137,15 @@ class InvoiceLinks:
 		return invoice_link(self)
 
 
+class DunningLinks:
+	"""Dunning: the customer's unpaid invoices to pay (a Payment Request can't be made against a
+	Dunning, so its letter links to each invoice's payment)."""
+
+	@property
+	def payment_link(self) -> str | None:
+		return customer_link(self.customer) if self.docstatus != 2 else None
+
+
 class CustomerLinks:
 	"""Customer: the page with their unpaid invoices to pay, for statements."""
 
@@ -195,18 +206,20 @@ def payment_url(invoice) -> str:
 
 
 def add_link_to_email(doc, method=None) -> None:
-	"""An invoice emailed to the customer carries its payment link (Accounts Settings)."""
+	"""An invoice, or a Dunning letter, emailed to the customer carries its payment link (Accounts
+	Settings)."""
 	if not (
 		erpnext_installed()
-		and doc.reference_doctype == "Sales Invoice"
+		and doc.reference_doctype in LINKED
 		and doc.communication_type == "Communication"
 		and doc.sent_or_received == "Sent"
 		and settings().payment_link_in_emails
 	):
 		return
-	link = invoice_link(frappe.get_doc("Sales Invoice", doc.reference_name))
+	reference = frappe.get_doc(doc.reference_doctype, doc.reference_name)
+	link = reference.payment_link
 	if link and link not in (doc.content or ""):
-		doc.content = (doc.content or "") + link_html(doc.reference_name, link)
+		doc.content = (doc.content or "") + link_html(reference, link)
 
 
 def pdf_body_html(template, args, **kwargs):
@@ -218,21 +231,24 @@ def pdf_body_html(template, args, **kwargs):
 	html = frappe.get_attr(previous)(template=template, args=args, **kwargs)
 	doc = args.get("doc")
 	if not (
-		erpnext_installed()
-		and getattr(doc, "doctype", None) == "Sales Invoice"
-		and settings().payment_link_in_prints
+		erpnext_installed() and getattr(doc, "doctype", None) in LINKED and settings().payment_link_in_prints
 	):
 		return html
-	link = invoice_link(doc)
+	link = doc.payment_link
 	if not link:
 		return html
-	block = link_html(doc.name, link, printed=True)
+	block = link_html(doc, link, printed=True)
 	closing = html.rfind("</body>")
 	return html[:closing] + block + html[closing:] if closing != -1 else html + block
 
 
-def link_html(invoice: str, link: str, printed: bool = False) -> str:
+def link_html(doc, link: str, printed: bool = False) -> str:
 	esc = frappe.utils.escape_html
+	label = (
+		_("Pay your overdue invoices online:")
+		if doc.doctype == "Dunning"
+		else _("Pay invoice {0} online:").format(doc.name)
+	)
 	style = (
 		"margin-top:16px;padding:10px 12px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;"
 		if printed
@@ -240,7 +256,7 @@ def link_html(invoice: str, link: str, printed: bool = False) -> str:
 	)
 	return (
 		f'<div class="invoice-payment-link" style="{style}">'
-		f"{esc(_('Pay invoice {0} online:').format(invoice))} "
+		f"{esc(label)} "
 		f'<a href="{esc(link)}">{esc(link if printed else _("Pay now"))}</a></div>'
 	)
 
