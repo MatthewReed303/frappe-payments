@@ -64,6 +64,16 @@ def get_context(context):
 				redirect_to_message(
 					_("Payment not available"), _("This payment was cancelled, so it can't be paid.")
 				)
+			# ERPNext's link carries the email the request is sent to, and the intent shown here
+			# carries it as the receipt email: a visitor who only guessed the request's name is
+			# turned away rather than shown it
+			payer_email = frappe.db.get_value(
+				context.reference_doctype, context.reference_docname, "email_to"
+			)
+			if payer_email and payer_email.strip().lower() != (context.payer_email or "").strip().lower():
+				redirect_to_message(
+					_("Payment not available"), _("This payment link isn't valid. Please ask for a new one.")
+				)
 			settings = frappe.get_doc("Stripe Settings", gateway_controller)
 			try:
 				intent = open_payment_intent(settings, context.reference_doctype, context.reference_docname)
@@ -124,7 +134,8 @@ def get_header_image(doc, gateway_controller):
 
 
 # Guest checkout: buyers pay without a site account.
-@frappe.whitelist(allow_guest=True)  # nosemgrep
+@frappe.whitelist(allow_guest=True, methods=["POST"])  # nosemgrep
+@rate_limit(limit=10, seconds=60 * 10)
 def make_payment(
 	stripe_token_id: str,
 	data: str,
@@ -144,8 +155,6 @@ def make_payment(
 	else:
 		data = frappe.get_doc("Stripe Settings", gateway_controller).create_request(data)
 
-	# Also reachable over GET, which Frappe does not commit, and the payment must be recorded.
-	frappe.db.commit()  # nosemgrep
 	return data
 
 

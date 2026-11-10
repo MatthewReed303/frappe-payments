@@ -396,12 +396,20 @@ class StripeSettings(Document):
 				"request_id": ["like", "pi_%"],
 			},
 		)
+		if self.get_password(fieldname="webhook_secret", raise_exception=False):
+			methods = {"automatic_payment_methods": {"enabled": True}}
+		else:
+			# without the webhook a payment is recorded only when the payer comes back, so only
+			# cards (and the wallets that pay by card) are offered: bank debits settle days later
+			methods = {"payment_method_types": ["card"]}
 		intent = client.payment_intents.create(
 			params={
 				"amount": units,
 				"currency": currency.lower(),
-				"automatic_payment_methods": {"enabled": True},
-				"description": reference.get("subject") or f"{_(reference_doctype)} {reference_docname}",
+				**methods,
+				# the pay page shows the intent to whoever has the link: the description names only
+				# the document, never the customer
+				"description": f"{_(reference_doctype)} {reference_docname}",
 				# a request made without the customer's email holds the user who made it
 				"receipt_email": validate_email_address(reference.get("email_to") or "") or None,
 				"metadata": {
@@ -659,19 +667,26 @@ def webhook(gateway: str | None = None):
 
 def record_refund(refund) -> None:
 	"""Tell staff, on the documents the payment paid, about a refund made in Stripe's dashboard once
-	it has gone through, and about any refund that failed. A refund made here carries its key and is
-	recorded here."""
-	made_here = bool((refund.metadata or {}).get("key"))
+	it has gone through, and about any refund that failed. A refund made here is logged here."""
 	if not refund.payment_intent or refund.status not in ("succeeded", "failed", "canceled"):
 		return
-	if refund.status == "succeeded" and made_here:
+	# the log is written in the transaction of the document refunding: if that was undone, the
+	# refund carries its key but is recorded nowhere
+	key = (refund.metadata or {}).get("key")
+	if refund.status == "succeeded" and frappe.db.exists(
+		"Integration Request", {"integration_request_service": "Stripe", "request_id": refund.id}
+	):
 		return
 	paid = paid_request(refund.payment_intent)
 	if not paid or not first_time("Stripe", f"{refund.id}:{refund.status}", {"refund": refund.id}):
 		return
 	reference = frappe.get_doc(paid.reference_doctype, paid.reference_docname)
 	amount = fmt_money(major_units(refund.amount, refund.currency), currency=refund.currency.upper())
-	if refund.status == "succeeded":
+	if refund.status == "succeeded" and key:
+		note = _(
+			"{0} of the card payment for {1} {2} was refunded for {3}, but the refund wasn't recorded here. Check that it is recorded in ERPNext, and don't refund it again."
+		).format(amount, _(reference.doctype), reference.name, key)
+	elif refund.status == "succeeded":
 		note = _(
 			"{0} of the card payment for {1} {2} was refunded in Stripe. Record the refund in ERPNext, and don't refund it again."
 		).format(amount, _(reference.doctype), reference.name)

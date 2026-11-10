@@ -156,11 +156,19 @@ class TestStripeSettings(IntegrationTestCase):
 			self.assertIn("10.00", tell_staff.call_args.args[1])
 			self.assertIn("refunded in Stripe", tell_staff.call_args.args[1])
 			self.assertEqual(first_time.call_args.args[1], "re_1:succeeded")
-			# a refund made here carries its key; one still pending is told once it is settled
+			# a refund made here is logged here; one still pending is told once it is settled
 			tell_staff.reset_mock()
-			stripe_settings.record_refund(frappe._dict(refund, metadata={"key": "CN-1"}))
+			with patch("frappe.db.exists", return_value=True) as logged:
+				stripe_settings.record_refund(frappe._dict(refund, metadata={"key": "CN-1"}))
+			self.assertEqual(logged.call_args.args[1]["request_id"], "re_1")
 			stripe_settings.record_refund(frappe._dict(refund, status="pending"))
 			tell_staff.assert_not_called()
+			# made here, but the document refunding was undone and the refund never logged
+			with patch("frappe.db.exists", return_value=False):
+				stripe_settings.record_refund(frappe._dict(refund, metadata={"key": "CN-1"}))
+			self.assertIn("wasn't recorded here", tell_staff.call_args.args[1])
+			self.assertIn("CN-1", tell_staff.call_args.args[1])
+			tell_staff.reset_mock()
 			# a refund that fails is told, wherever it was made
 			stripe_settings.record_refund(frappe._dict(refund, status="failed", metadata={"key": "CN-1"}))
 			self.assertIn("failed in Stripe", tell_staff.call_args.args[1])
@@ -529,6 +537,95 @@ class TestStripeSettings(IntegrationTestCase):
 		):
 			settings.payment_intent("Payment Request", "PR-3")
 		self.assertIsNone(client.payment_intents.create.call_args.kwargs["params"]["receipt_email"])
+
+	def test_without_a_webhook_only_cards_are_offered(self):
+		from unittest.mock import MagicMock, patch
+
+		import frappe
+
+		from payments.payment_gateways.doctype.stripe_settings import stripe_settings
+
+		request = frappe._dict(email_to="jane@example.com", subject="Payment Request for Jane Doe")
+		for secret, offered in (
+			(None, {"payment_method_types": ["card"]}),
+			("whsec_x", {"automatic_payment_methods": {"enabled": True}}),
+		):
+			settings = frappe.new_doc("Stripe Settings")
+			settings.get_password = lambda *args, secret=secret, **kwargs: secret
+			client = MagicMock()
+			client.payment_intents.create.return_value = frappe._dict(id="pi_test_3")
+			with (
+				patch.object(stripe_settings.StripeSettings, "client", return_value=client),
+				patch.object(stripe_settings, "intent_request", return_value=None),
+				patch("frappe.get_doc", return_value=request),
+				patch.object(stripe_settings, "amount_to_pay", return_value=(40, "USD")),
+				patch("frappe.db.count", return_value=0),
+				patch.object(stripe_settings, "create_request_log"),
+			):
+				settings.payment_intent("Payment Request", "PR-4")
+			params = client.payment_intents.create.call_args.kwargs["params"]
+			self.assertEqual({key: params[key] for key in offered}, offered)
+			self.assertEqual(len({"payment_method_types", "automatic_payment_methods"} & set(params)), 1)
+			# the description, which the pay page shows, names the document and not the customer
+			self.assertNotIn("Jane", params["description"])
+			self.assertIn("PR-4", params["description"])
+
+	def test_a_guessed_pay_link_isnt_shown_the_payment(self):
+		from unittest.mock import MagicMock, patch
+
+		import frappe
+
+		from payments.templates.pages import stripe_checkout
+
+		settings = MagicMock()
+		settings.payment_intent.return_value = frappe._dict(
+			status="requires_payment_method", client_secret="cs_x", currency="usd", amount=1000
+		)
+		get_doc, get_value = frappe.get_doc, frappe.db.get_value
+		for payer_email, shown in (("", False), ("someone@example.com", False), ("Jane@Example.com", True)):
+			form = dict.fromkeys(stripe_checkout.expected_keys, "x")
+			form.update(
+				amount=10, currency="USD", reference_doctype="Payment Request", payer_email=payer_email
+			)
+			context = frappe._dict()
+			settings.reset_mock()
+			with (
+				patch.object(frappe.local, "form_dict", frappe._dict(form)),
+				patch.object(stripe_checkout, "get_gateway_controller", return_value="_Test Stripe"),
+				patch.object(stripe_checkout, "get_api_key", return_value="pk_test_x"),
+				patch.object(stripe_checkout, "get_header_image", return_value=None),
+				patch.object(stripe_checkout, "is_a_subscription", return_value=False),
+				patch(
+					"frappe.db.get_value",
+					side_effect=lambda *args, **kwargs: (
+						{"docstatus": 1, "email_to": "jane@example.com"}[args[2]]
+						if args[:2] == ("Payment Request", "x")
+						else get_value(*args, **kwargs)
+					),
+				),
+				patch(
+					"frappe.get_doc",
+					side_effect=lambda *args, **kwargs: (
+						settings if args[0] == "Stripe Settings" else get_doc(*args, **kwargs)
+					),
+				),
+			):
+				if shown:
+					stripe_checkout.get_context(context)
+				else:
+					with self.assertRaises(frappe.Redirect):
+						stripe_checkout.get_context(context)
+			self.assertEqual(settings.payment_intent.called, shown)
+			self.assertEqual(context.get("client_secret"), "cs_x" if shown else None)
+
+	def test_the_old_card_form_posts_its_payment(self):
+		import frappe
+
+		from payments.templates.pages import stripe_checkout
+
+		self.assertEqual(
+			frappe.allowed_http_methods_for_whitelisted_func[stripe_checkout.make_payment], ["POST"]
+		)
 
 	def test_a_disputed_payment_is_noted_for_staff(self):
 		from unittest.mock import MagicMock, patch
