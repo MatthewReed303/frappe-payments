@@ -100,9 +100,8 @@ def get_context(context):
 			# what the intent asks (the request's outstanding amount), with the code, as many
 			# currencies share a symbol
 			currency = intent.currency.upper()
-			context["amount"] = (
-				f"{fmt_money(amount=major_units(intent.amount, currency), currency=currency)} {currency}"
-			)
+			money = fmt_money(amount=major_units(intent.amount, currency), currency=currency)
+			context["amount"] = f"{money} {currency}"
 
 	else:
 		frappe.redirect_to_message(
