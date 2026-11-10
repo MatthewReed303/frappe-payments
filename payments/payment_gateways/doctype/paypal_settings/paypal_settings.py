@@ -74,7 +74,7 @@ import json
 from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from typing import NamedTuple
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlparse
 from zoneinfo import ZoneInfo
 
 import frappe
@@ -82,6 +82,7 @@ import requests
 from frappe import _
 from frappe.integrations.utils import create_request_log, make_post_request
 from frappe.model.document import Document
+from frappe.rate_limiter import rate_limit
 from frappe.utils import (
 	call_hook_method,
 	cint,
@@ -98,7 +99,7 @@ from frappe.utils import (
 from frappe.utils.data import get_system_timezone
 
 from payments.utils import create_payment_gateway
-from payments.utils.payment_request import NothingToPay, amount_to_pay, tell_staff
+from payments.utils.payment_request import NothingToPay, amount_to_pay, first_time, tell_staff
 
 api_path = "/api/method/payments.payment_gateways.doctype.paypal_settings.paypal_settings"
 
@@ -663,7 +664,9 @@ class PayPalSettings(Document):
 				update_modified=False,
 			)
 			return "/payment-failed"
-		reference = get_reference(request.reference_doctype, request.reference_docname)
+		# two orders for one document can be paid at the same moment: the document is read with a
+		# lock, so the second is checked against what the first left to pay
+		reference = get_reference(request.reference_doctype, request.reference_docname, for_update=True)
 		if reference and reference.docstatus == 2:
 			# paid in the moment the document was cancelled: kept for staff to refund or record
 			request.db_set(
@@ -690,7 +693,7 @@ class PayPalSettings(Document):
 				),
 			)
 		# orders are only made here, for what the document asked, so the payment must be the
-		# order's whole amount, no more than the document's total
+		# order's whole amount, no more than the document still asks
 		if not same_amount(capture.get("amount"), asked or unit.get("amount")) or more_than_asked(
 			reference, capture.get("amount")
 		):
@@ -741,17 +744,16 @@ class PayPalSettings(Document):
 		}
 		return "/payment-success?" + urlencode({key: value for key, value in query.items() if value})
 
-	def refundable(self, paid) -> float:
-		"""What is left of a PayPal payment to refund, after refunds made here or in PayPal."""
+	def refunds(self, paid) -> list[dict]:
+		"""The refunds of a PayPal payment, made here or in PayPal, that went through or may yet."""
 		order = self.api("GET", f"/v2/checkout/orders/{quote(paid.order, safe='')}")
 		payments = (order.get("purchase_units") or [{}])[0].get("payments") or {}
-		refunded = sum(
-			flt((refund.get("amount") or {}).get("value"))
+		return [
+			refund
 			for refund in payments.get("refunds") or []
 			if refund.get("status") in ("COMPLETED", "PENDING")
 			and up_link_id(refund, "/captures/") in (None, paid.capture)
-		)
-		return flt(paid.amount) - refunded
+		]
 
 	def refund(self, reference_doctype: str, reference_docname: str, amount: float, key: str) -> str:
 		"""Refund part or all of what a document's PayPal payment took, once per key (e.g. the
@@ -793,24 +795,31 @@ class PayPalSettings(Document):
 			if json.loads(made.data or "{}").get("key") == key:
 				return made.request_id
 		value = paypal_amount(amount, paid.currency)
-		left = self.refundable(paid)
-		if flt(value["value"]) > left + 0.005:
-			frappe.throw(
-				_(
-					"Only {0} of this PayPal payment can still be refunded: the rest was refunded in PayPal. Record that refund in ERPNext, then refund what is left."
-				).format(money(paypal_amount(left, paid.currency)))
+		refunds = self.refunds(paid)
+		# the log of a refund made for this key is undone with the document refunding, and PayPal
+		# forgets a PayPal-Request-Id: the refund PayPal holds for the key is the answer then
+		refund = next((made for made in refunds if made.get("custom_id") == refund_mark(key)), None)
+		if refund:
+			value = {**value, **(refund.get("amount") or {})}
+		else:
+			left = flt(paid.amount) - sum(flt((made.get("amount") or {}).get("value")) for made in refunds)
+			if flt(value["value"]) > left + 0.005:
+				frappe.throw(
+					_(
+						"Only {0} of this PayPal payment can still be refunded: the rest was refunded in PayPal. Record that refund in ERPNext, then refund what is left."
+					).format(money(paypal_amount(left, paid.currency)))
+				)
+			refund = self.api(
+				"POST",
+				f"/v2/payments/captures/{quote(paid.capture, safe='')}/refund",
+				payload={"amount": value, "custom_id": refund_mark(key)},
+				headers={
+					"PayPal-Request-Id": request_key("refund", paid.capture, key, value["value"]),
+					"Prefer": "return=representation",
+				},
 			)
-		refund = self.api(
-			"POST",
-			f"/v2/payments/captures/{quote(paid.capture, safe='')}/refund",
-			payload={"amount": value, "custom_id": refund_mark(key)},
-			headers={
-				"PayPal-Request-Id": request_key("refund", paid.capture, key, value["value"]),
-				"Prefer": "return=representation",
-			},
-		)
-		if refund.get("status") in ("CANCELLED", "FAILED"):
-			frappe.throw(_("PayPal didn't make the refund ({0})").format(refund.get("status")))
+			if refund.get("status") in ("CANCELLED", "FAILED"):
+				frappe.throw(_("PayPal didn't make the refund ({0})").format(refund.get("status")))
 		# logged against the payment it refunds, in the caller's transaction
 		frappe.get_doc(
 			{
@@ -838,6 +847,10 @@ class PayPalSettings(Document):
 		"""Whether PayPal says it sent a webhook event, for the webhook with this Webhook ID."""
 		headers = {field: frappe.get_request_header(header) for field, header in SIGNATURE_HEADERS.items()}
 		if not (self.uses_rest_api and self.webhook_id and all(headers.values())):
+			return False
+		# PayPal is asked about every event: one whose certificate isn't PayPal's is refused first
+		cert = urlparse(headers["cert_url"])
+		if cert.scheme != "https" or not (cert.hostname or "").endswith(".paypal.com"):
 			return False
 		try:
 			event = json.loads(body)
@@ -1289,9 +1302,18 @@ def same_amount(a: dict | None, b: dict | None) -> bool:
 
 
 def more_than_asked(reference, amount: dict | None) -> bool:
+	"""Whether a payment is more than its document asks: for a Payment Request, more than is left
+	of it to pay."""
 	if not reference or not reference.meta.has_field("grand_total"):
 		return False
-	total = paypal_amount(reference.get("grand_total"), reference.get("currency"))
+	if reference.doctype == "Payment Request":
+		try:
+			total = paypal_amount(*amount_to_pay(reference))
+		except NotPayable:
+			frappe.clear_last_message()
+			return True
+	else:
+		total = paypal_amount(reference.get("grand_total"), reference.get("currency"))
 	amount = paypal_amount((amount or {}).get("value"), (amount or {}).get("currency_code"))
 	return amount["currency_code"] != total["currency_code"] or Decimal(amount["value"]) > Decimal(
 		total["value"]
@@ -1310,9 +1332,9 @@ def format_paypal_time(value: str) -> str:
 	return format_datetime(convert_utc_to_system_timezone(when))
 
 
-def get_reference(doctype: str | None, name: str | None):
+def get_reference(doctype: str | None, name: str | None, for_update: bool = False):
 	if doctype and name and frappe.db.exists(doctype, name):
-		return frappe.get_doc(doctype, name)
+		return frappe.get_doc(doctype, name, for_update=for_update)
 	return None
 
 
@@ -1419,6 +1441,7 @@ def cancel_payment(integration_request: str):
 
 # PayPal calls this; the event is verified with PayPal for the webhook with the Webhook ID.
 @frappe.whitelist(allow_guest=True, methods=["POST"])  # nosemgrep
+@rate_limit(limit=100, seconds=60)
 def webhook():
 	"""Record payments whose payer didn't come back to the site, and tell staff about refunds made
 	in PayPal, reversals and disputes."""
@@ -1427,23 +1450,21 @@ def webhook():
 	if not settings.verify_webhook(body):
 		raise frappe.PermissionError
 	event = json.loads(body)
-	# PayPal sends an event again until it's answered: each is acted on once
-	if frappe.db.exists(
-		"Integration Request", {"integration_request_service": "PayPal", "request_id": event["id"]}
-	):
+	# PayPal sends an event again until it's answered, at times twice at once: each is acted on once
+	if not first_time("PayPal", event["id"], event):
 		return {"received": True}
 	about = settings.handle_event(event)
-	if about:
-		create_request_log(
-			event,
-			service_name="PayPal",
-			reference_doctype="Integration Request",
-			reference_docname=about,
-			request_id=event["id"],
-			request_description=event.get("event_type"),
-			is_remote_request=1,
-			status="Completed",
-		)
+	frappe.db.set_value(
+		"Integration Request",
+		{"integration_request_service": "PayPal", "request_id": event["id"]},
+		{
+			"reference_doctype": "Integration Request" if about else None,
+			"reference_docname": about,
+			"request_description": event.get("event_type"),
+			"is_remote_request": 1,
+		},
+		update_modified=False,
+	)
 	# webhooks are not committed otherwise
 	frappe.db.commit()  # nosemgrep
 	return {"received": True}

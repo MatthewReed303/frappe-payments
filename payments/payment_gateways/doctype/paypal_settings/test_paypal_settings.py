@@ -466,6 +466,32 @@ class TestPayPalSettings(IntegrationTestCase):
 			tell_staff.assert_called_once()
 		reference.run_method.assert_not_called()
 
+	def test_a_second_order_for_one_request_isnt_recorded_past_what_is_owed(self):
+		settings = self.settings()
+		# the other order paid it all, or all but 100
+		for order, reference in (
+			(captured("ORDER-8"), payment_request(self.reference_name, status="Paid", outstanding=0)),
+			(
+				captured("ORDER-9"),
+				payment_request(self.reference_name, status="Partially Paid", outstanding=100),
+			),
+		):
+			request = self.order_request(order_id=order["id"])
+			fake = FakePayPal({("GET", f"/v2/checkout/orders/{order['id']}"): order})
+			with (
+				patch.object(pp, "http_request", fake),
+				patch.object(pp, "get_reference", return_value=reference) as get_reference,
+				patch.object(pp, "tell_staff") as tell_staff,
+				patch("frappe.log_error"),
+			):
+				self.assertIsInstance(settings.complete(request), pp.Message)
+			# read with the lock the other order's recording holds until it is done
+			self.assertTrue(get_reference.call_args.kwargs.get("for_update"))
+			request.reload()
+			self.assertEqual(request.status, "Failed")
+			tell_staff.assert_called_once()
+			reference.run_method.assert_not_called()
+
 	def test_a_cancelled_payment_request_isnt_charged(self):
 		settings = self.settings()
 		request = self.order_request(order_id="ORDER-8")
@@ -517,11 +543,13 @@ class TestPayPalSettings(IntegrationTestCase):
 		http = MagicMock()
 		http.get_data.return_value = body
 		http.headers = {header: "x" for header in pp.SIGNATURE_HEADERS.values()}
+		http.headers["PAYPAL-CERT-URL"] = "https://api.sandbox.paypal.com/v1/notifications/certs/CERT-1"
 		verdict = {"verification_status": "FAILURE"}
 		fake = FakePayPal({("POST", "/v1/notifications/verify-webhook-signature"): lambda **kwargs: verdict})
 		get_doc = frappe.get_doc
 		with (
 			patch.object(frappe.local, "request", http, create=True),
+			patch.object(frappe.local, "request_ip", "_test-paypal-webhook", create=True),
 			patch.object(pp, "http_request", fake),
 			patch(
 				"frappe.get_doc",
@@ -544,6 +572,15 @@ class TestPayPalSettings(IntegrationTestCase):
 			headers = http.headers
 			http.headers = {}
 			self.assertRaises(frappe.PermissionError, pp.webhook)
+			# a certificate that isn't PayPal's is refused without asking PayPal
+			for cert_url in (
+				"https://example.com/certs/CERT-1",
+				"https://api.paypal.com.example.com/certs/CERT-1",
+				"http://api.paypal.com/v1/notifications/certs/CERT-1",
+			):
+				http.headers = {**headers, "PAYPAL-CERT-URL": cert_url}
+				self.assertRaises(frappe.PermissionError, pp.webhook)
+			self.assertEqual(len(fake.made("POST", "/v1/notifications/verify-webhook-signature")), 1)
 			http.headers = headers
 
 			verdict["verification_status"] = "SUCCESS"
@@ -553,9 +590,11 @@ class TestPayPalSettings(IntegrationTestCase):
 					"Integration Request", {"request_id": event_id, "reference_docname": paid.name}
 				)
 			)
-			# delivered again, the event is acted on once
+			# delivered again, the event is acted on once, even when both copies come at once
 			with patch.object(pp.PayPalSettings, "handle_event") as handle_event:
 				self.assertEqual(pp.webhook(), {"received": True})
+				with patch.object(pp.frappe.db, "exists", return_value=False):
+					self.assertEqual(pp.webhook(), {"received": True})
 			handle_event.assert_not_called()
 
 	def test_refund_takes_back_part_of_a_payment_once(self):
@@ -572,6 +611,7 @@ class TestPayPalSettings(IntegrationTestCase):
 				"id": f"REF-{kwargs['json']['custom_id'].removeprefix(pp.REFUND_MARK)}",
 				"status": "COMPLETED",
 				"amount": kwargs["json"]["amount"],
+				"custom_id": kwargs["json"]["custom_id"],
 			}
 			refunds.append(made)
 			return made
@@ -609,6 +649,13 @@ class TestPayPalSettings(IntegrationTestCase):
 				settings.refund("Payment Request", self.reference_name, 12.5, "CN-1"), "REF-CN-1"
 			)
 			self.assertEqual(len(fake.made("POST", "/v2/payments/captures/CAP-11/refund")), 1)
+			# its log undone with the credit note, and asked again for another amount: PayPal's
+			# refund for that credit note is the answer, and is logged again
+			frappe.db.delete("Integration Request", {"request_id": "REF-CN-1"})
+			self.assertEqual(settings.refund("Payment Request", self.reference_name, 13, "CN-1"), "REF-CN-1")
+			self.assertEqual(len(fake.made("POST", "/v2/payments/captures/CAP-11/refund")), 1)
+			logged = frappe.db.get_value("Integration Request", {"request_id": "REF-CN-1"}, "data")
+			self.assertEqual(json.loads(logged)["amount"], 12.5)
 
 			self.assertEqual(settings.refund("Payment Request", self.reference_name, 5, "CN-2"), "REF-CN-2")
 			made = fake.made("POST", "/v2/payments/captures/CAP-11/refund")

@@ -1,3 +1,4 @@
+import hashlib
 import json
 
 import frappe
@@ -57,7 +58,7 @@ def first_time(service: str, key: str, data: dict | None = None) -> bool:
 	logged under its key the first time."""
 	if frappe.db.exists("Integration Request", {"integration_request_service": service, "request_id": key}):
 		return False
-	frappe.get_doc(
+	log = frappe.get_doc(
 		{
 			"doctype": "Integration Request",
 			"integration_request_service": service,
@@ -65,7 +66,15 @@ def first_time(service: str, key: str, data: dict | None = None) -> bool:
 			"status": "Completed",
 			"data": json.dumps(data or {}, default=str),
 		}
-	).insert(ignore_permissions=True)
+	)
+	# named after the key: the same news handled twice at once is logged, and so told, once
+	log.flags._name = hashlib.sha256(f"{service}:{key}".encode()).hexdigest()
+	frappe.db.savepoint("first_time")
+	try:
+		log.insert(ignore_permissions=True)
+	except frappe.DuplicateEntryError:
+		frappe.db.rollback(save_point="first_time")
+		return False
 	return True
 
 

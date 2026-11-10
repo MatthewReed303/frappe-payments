@@ -43,6 +43,10 @@ class TestPaymentRequestHelpers(IntegrationTestCase):
 		self.assertTrue(payment_request.first_time("_Test Gateway", key))
 		self.assertFalse(payment_request.first_time("_Test Gateway", key))
 		self.assertTrue(payment_request.first_time("_Test Gateway", f"{key}:closed"))
+		# sent twice at once, both see it unlogged: only one logs it
+		with patch.object(payment_request.frappe.db, "exists", return_value=False):
+			self.assertFalse(payment_request.first_time("_Test Gateway", key))
+		self.assertTrue(frappe.db.exists("Integration Request", {"request_id": f"{key}:closed"}))
 
 	def test_staff_are_told_on_the_document_and_the_one_it_asks_for(self):
 		order = MagicMock(doctype="Sales Order")
