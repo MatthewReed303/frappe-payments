@@ -94,7 +94,15 @@ before_uninstall = "payments.utils.delete_custom_fields"
 # ---------------
 # Extend standard doctype classes
 
-extend_doctype_class = {"Web Form": "payments.overrides.payment_webform.PaymentWebForm"}
+extend_doctype_class = {
+	"Web Form": "payments.overrides.payment_webform.PaymentWebForm",
+	# invoice payment links (payments.utils.invoice_links)
+	"Sales Invoice": "payments.utils.invoice_links.InvoiceLinks",
+	"Customer": "payments.utils.invoice_links.CustomerLinks",
+}
+after_migrate = "payments.utils.invoice_links.make_fields"
+pdf_body_html = "payments.utils.invoice_links.pdf_body_html"
+doctype_js = {"Sales Invoice": "public/js/sales_invoice.js"}
 
 # Document Events
 # ---------------
@@ -107,6 +115,11 @@ extend_doctype_class = {"Web Form": "payments.overrides.payment_webform.PaymentW
 # 		"on_trash": "method"
 # 	}
 # }
+
+doc_events = {
+	# an invoice emailed to the customer carries its payment link
+	"Communication": {"before_insert": "payments.utils.invoice_links.add_link_to_email"},
+}
 
 # Scheduled Tasks
 # ---------------
