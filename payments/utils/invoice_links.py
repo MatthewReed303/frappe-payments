@@ -278,6 +278,9 @@ FIELDS = {
 			"label": "Show the Link on Printed Invoices",
 			"default": "1",
 			"insert_after": "payment_link_in_emails",
+			"description": "Added to invoices printed with the Standard or a Jinja print format. Print formats "
+			"made with the print format builder (such as Sales Invoice Classic) show it when the letter "
+			'head\'s footer says {% if doc.payment_link %}<a href="{{ doc.payment_link }}">Pay online</a>{% endif %}.',
 			"depends_on": f"eval:doc.invoice_payment_links != '{OFF}'",
 		},
 	],
