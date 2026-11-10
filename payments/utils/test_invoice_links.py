@@ -115,7 +115,7 @@ class TestInvoiceLinks(IntegrationTestCase):
 		from payments.templates.pages import pay_invoice
 
 		key = invoice_links.key("Sales Invoice", self.invoice.name)
-		frappe.form_dict = frappe._dict(invoice=self.invoice.name, key=key)
+		frappe.local.form_dict = frappe._dict(invoice=self.invoice.name, key=key)
 		with (
 			patch.object(invoice_links, "payment_url", return_value=PAYMENT_URL),
 			self.assertRaises(frappe.Redirect),
@@ -123,10 +123,10 @@ class TestInvoiceLinks(IntegrationTestCase):
 			pay_invoice.get_context(frappe._dict())
 		self.assertEqual(frappe.local.flags.redirect_location, PAYMENT_URL)
 
-		frappe.form_dict = frappe._dict(invoice=self.invoice.name, key="0" * 32)
+		frappe.local.form_dict = frappe._dict(invoice=self.invoice.name, key="0" * 32)
 		self.assertEqual(pay_invoice.get_context(frappe._dict()).title, "Link not valid")
 
-		frappe.form_dict = frappe._dict(
+		frappe.local.form_dict = frappe._dict(
 			customer="_Test Customer", key=invoice_links.key("Customer", "_Test Customer")
 		)
 		listed = pay_invoice.get_context(frappe._dict())

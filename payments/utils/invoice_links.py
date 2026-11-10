@@ -12,7 +12,6 @@ a statement email's body can say {{ customer.payment_link }}."""
 
 import hashlib
 import hmac
-from contextlib import contextmanager
 from urllib.parse import urlencode
 
 import frappe
@@ -154,31 +153,19 @@ class CustomerLinks:
 		return customer_link(self.name)
 
 
-@contextmanager
-def as_administrator():
-	"""Make the Payment Request as Administrator for a payer who isn't signed in: ERPNext checks
-	Desk permissions. Callers check the link's key first."""
-	session = frappe.local.session
-	original = (session.user, session.sid, session.data)
-	frappe.set_user("Administrator")
-	try:
-		yield
-	finally:
-		session.user, session.sid, session.data = original
-		frappe.local.cache = {}
-		frappe.local.role_permissions = {}
-		frappe.local.user_perms = None
-
-
 def payment_url(invoice) -> str:
 	"""The gateway page for what the invoice still owes: its open Payment Request's, else a new
 	one's (an open one asking a different amount, after a part payment, is cancelled first)."""
-	from erpnext.accounts.doctype.payment_request.payment_request import make_payment_request
+	from erpnext.accounts.doctype.payment_request.payment_request import (
+		make_payment_request,
+		run_as_administrator,
+	)
 
 	# two clicks at once make one request
 	frappe.db.get_value("Sales Invoice", invoice.name, "name", for_update=True)
 	owed = flt(invoice.outstanding_amount, invoice.precision("outstanding_amount"))
-	with as_administrator():
+	# a payer who isn't signed in has no Desk permissions; callers check the link's key first
+	with run_as_administrator():
 		for row in frappe.get_all(
 			"Payment Request",
 			filters={
