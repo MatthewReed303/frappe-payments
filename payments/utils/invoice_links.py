@@ -33,14 +33,23 @@ def erpnext_installed() -> bool:
 def settings() -> frappe._dict:
 	"""Accounts Settings' payment link fields; one never saved has its default (links on, in emails
 	and prints)."""
+	defaults = {"invoice_payment_links": ALL, "payment_link_in_emails": 1, "payment_link_in_prints": 1}
+	# what was saved, as get_single_value reads an unsaved Check as 0
+	saved = dict(
+		frappe.get_all(
+			"Singles",
+			filters={"doctype": "Accounts Settings", "field": ["in", list(defaults)]},
+			fields=["field", "value"],
+			as_list=True,
+		)
+	)
 	values = frappe._dict()
-	for field, default in (
-		("invoice_payment_links", ALL),
-		("payment_link_in_emails", 1),
-		("payment_link_in_prints", 1),
-	):
-		value = frappe.db.get_single_value("Accounts Settings", field)
-		values[field] = default if value in (None, "") else value
+	for field, default in defaults.items():
+		value = saved.get(field)
+		if value in (None, ""):
+			values[field] = default
+		else:
+			values[field] = value if field == "invoice_payment_links" else frappe.utils.cint(value)
 	if not erpnext_installed():
 		values.invoice_payment_links = OFF
 	return values
