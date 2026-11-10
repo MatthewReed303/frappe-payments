@@ -36,11 +36,9 @@ def settings() -> frappe._dict:
 	defaults = {"invoice_payment_links": ALL, "payment_link_in_emails": 1, "payment_link_in_prints": 1}
 	# what was saved, as get_single_value reads an unsaved Check as 0
 	saved = dict(
-		frappe.get_all(
-			"Singles",
-			filters={"doctype": "Accounts Settings", "field": ["in", list(defaults)]},
-			fields=["field", "value"],
-			as_list=True,
+		frappe.db.sql(
+			"select field, value from `tabSingles` where doctype = %s and field in %s",
+			("Accounts Settings", tuple(defaults)),
 		)
 	)
 	values = frappe._dict()
