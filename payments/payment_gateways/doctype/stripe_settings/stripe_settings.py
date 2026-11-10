@@ -374,7 +374,11 @@ class StripeSettings(Document):
 		existing = intent_request(reference_doctype, reference_docname)
 		intent = client.payment_intents.retrieve(existing.request_id) if existing else None
 		if intent and intent.status == "succeeded":
-			return intent
+			if existing.status != "Failed":
+				# paid: the caller records it, or sends the payer where it sent them before
+				return intent
+			# refused (and refunded by staff): what is still owed is paid with a new intent
+			intent = None
 		amount, currency = amount_to_pay(reference)
 		self.validate_transaction_currency(currency)
 		self.validate_minimum_transaction_amount(currency, amount)

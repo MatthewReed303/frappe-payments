@@ -408,6 +408,35 @@ class TestStripeSettings(IntegrationTestCase):
 			)
 			self.assertIn("nothing left to pay", settings.payment_problem(intent, reference))
 
+	def test_a_refused_payment_doesnt_block_paying_again(self):
+		from unittest.mock import MagicMock, patch
+
+		from payments.payment_gateways.doctype.stripe_settings import stripe_settings
+
+		reference = MagicMock()
+		reference.get.return_value = ""
+		settings = frappe.new_doc("Stripe Settings")
+		settings.validate_transaction_currency = lambda currency: None
+		settings.validate_minimum_transaction_amount = lambda currency, amount: None
+		for status, expected in (("Queued", "pi_old"), ("Completed", "pi_old"), ("Failed", "pi_new")):
+			client = MagicMock()
+			client.payment_intents.retrieve.return_value = frappe._dict(id="pi_old", status="succeeded")
+			client.payment_intents.create.return_value = frappe._dict(id="pi_new")
+			settings.client = lambda client=client: client
+			with (
+				self.subTest(status=status),
+				patch("frappe.get_doc", return_value=reference),
+				patch.object(
+					stripe_settings,
+					"intent_request",
+					return_value=frappe._dict(name="IR-1", request_id="pi_old", status=status),
+				),
+				patch.object(stripe_settings, "amount_to_pay", return_value=(12.5, "USD")),
+				patch.object(stripe_settings, "create_request_log"),
+				patch("frappe.db.count", return_value=1),
+			):
+				self.assertEqual(settings.payment_intent("Payment Request", "PR-1").id, expected)
+
 	def test_a_payment_request_is_paid_through_its_own_gateway(self):
 		from unittest.mock import patch
 

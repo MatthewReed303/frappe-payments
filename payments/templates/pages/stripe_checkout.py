@@ -73,9 +73,10 @@ def get_context(context):
 					_("Payment not available"), str(e) or _("There's nothing left to pay here.")
 				)
 			if intent.status == "succeeded":
-				# paid already (the payer came back to this page): recorded once, then on as after paying
-				frappe.local.flags.commit = True
+				# paid already (the payer came back to this page): recorded once, then on as after paying.
+				# Kept only once recorded: if recording fails, nothing is kept and the webhook tries again
 				outcome = settings.record_payment_intent(intent)
+				frappe.local.flags.commit = True
 				frappe.local.flags.redirect_location = (
 					outcome.location if outcome else not_recorded_location()
 				)
