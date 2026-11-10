@@ -123,10 +123,11 @@ class TestInvoiceLinks(IntegrationTestCase):
 			}
 		).insert(ignore_permissions=True)
 		self.assertIn(self.invoice.payment_link.replace("&", "&amp;"), communication.content)
-		self.assertIn("invoice-payment-link", frappe.get_print("Sales Invoice", self.invoice.name))
+		# prints made with a template (Standard, or a Jinja print format)
+		self.assertIn("invoice-payment-link", frappe.get_print("Sales Invoice", self.invoice.name, "Standard"))
 
 		self.set_mode(invoice_links.ALL, emails=0, prints=0)
-		self.assertNotIn("invoice-payment-link", frappe.get_print("Sales Invoice", self.invoice.name))
+		self.assertNotIn("invoice-payment-link", frappe.get_print("Sales Invoice", self.invoice.name, "Standard"))
 
 	def test_a_statement_can_link_to_the_customers_invoices(self):
 		customer = frappe.get_doc("Customer", "_Test Customer")
