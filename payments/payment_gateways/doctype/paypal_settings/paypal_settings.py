@@ -1283,7 +1283,8 @@ def refund_mark(key: str) -> str:
 
 def request_key(*parts) -> str:
 	"""A PayPal-Request-Id: PayPal answers a request made again with the same id as it did the first time."""
-	return hashlib.sha256(":".join((frappe.local.site, *map(cstr, parts))).encode()).hexdigest()
+	key = ":".join([frappe.local.site, *(cstr(part) for part in parts)])
+	return hashlib.sha256(key.encode()).hexdigest()
 
 
 def paypal_amount(amount, currency: str) -> dict:

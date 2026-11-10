@@ -120,6 +120,7 @@ class TestPayPalSettings(IntegrationTestCase):
 		for client_id in self.client_ids:
 			for host in (pp.SANDBOX_HOST, pp.LIVE_HOST):
 				frappe.cache.delete_value(pp.token_cache_key(host, client_id))
+		super().tearDown()
 
 	def settings(self, **values):
 		settings = frappe.new_doc("PayPal Settings")
